@@ -54,6 +54,7 @@ Good to know:
 - **Fades and timers run on the bridge**, so they finish even after the Claude session ends.
 - **Timers** use the bridge's v1 schedules (API v2 has none), so the Hue app doesn't show them.
   At most 10 can be pending at once; the bridge's schedule slots are shared with other apps.
+  `list_timers` counts down with this computer's clock; the bridge fires them by its own.
 - **Scenes** made with `create_scene` stay on the bridge; delete them in the Hue app.
 - **Names** match exactly or by a unique part ("living" finds "Living room"). Misspellings are
   only suggested, never acted on, and `all` must be spelled out.
