@@ -22,6 +22,7 @@ logging.getLogger("httpx2").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 V1_UNAUTHORIZED_ERROR_TYPE = 1
+V1_NOT_AVAILABLE_ERROR_TYPE = 3
 RE_PAIR_HINT = "The bridge no longer accepts this app's key; run `hue-mcp setup` again."
 
 
@@ -76,7 +77,8 @@ class HueBridge:
         return schedule_id
 
     async def delete_schedule(self, schedule_id: str) -> None:
-        await self._v1("DELETE", f"schedules/{schedule_id}")
+        """A timer that is already gone, e.g. it just fired, counts as deleted."""
+        await self._v1("DELETE", f"schedules/{schedule_id}", gone_is_fine=True)
 
     async def _v2(
         self, method: str, path: str, body: dict[str, Any] | None = None
@@ -100,7 +102,13 @@ class HueBridge:
         data: list[dict[str, Any]] = payload.get("data", [])
         return data, problems
 
-    async def _v1(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    async def _v1(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        gone_is_fine: bool = False,
+    ) -> Any:
         response = await self._send(method, f"/api/{self.config.app_key}/{path}", body)
         try:
             payload = response.json()
@@ -109,6 +117,8 @@ class HueBridge:
         errors = []
         if isinstance(payload, list):  # Writes answer with a list of successes and errors.
             errors = [item["error"] for item in payload if "error" in item]
+        if gone_is_fine:
+            errors = [e for e in errors if e.get("type") != V1_NOT_AVAILABLE_ERROR_TYPE]
         if any(error.get("type") == V1_UNAUTHORIZED_ERROR_TYPE for error in errors):
             raise HueError(RE_PAIR_HINT)
         if errors:

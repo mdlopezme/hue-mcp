@@ -352,3 +352,16 @@ async def test_a_connect_timeout_means_the_command_never_arrived(monkeypatch):
         await bridge.update("light", "x", {"on": {"on": True}})
     assert "Can't reach the Hue Bridge" in str(raised.value)
     assert "may still have taken effect" not in str(raised.value)
+
+
+async def test_deleting_a_timer_that_already_fired_is_not_an_error():
+    gone = {"type": 3, "address": "/schedules/7", "description": "resource not available"}
+    bridge, _ = bridge_answering(httpx2.Response(200, json=[{"error": gone}]))
+    await bridge.delete_schedule("7")
+
+
+async def test_other_delete_errors_still_count():
+    refused = {"type": 7, "address": "/schedules/7", "description": "invalid value"}
+    bridge, _ = bridge_answering(httpx2.Response(200, json=[{"error": refused}]))
+    with pytest.raises(HueError, match="invalid value"):
+        await bridge.delete_schedule("7")

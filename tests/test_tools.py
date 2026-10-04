@@ -1,6 +1,5 @@
 import time
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from datetime import UTC, datetime
 
 import anyio
 import httpx2
@@ -12,38 +11,13 @@ from hue_mcp.bridge import HueBridge
 from hue_mcp.errors import HueError
 from hue_mcp.server import MAX_ACTIVE_TIMERS, build_server
 
-from conftest import APP_KEY, CONFIG
+from conftest import APP_KEY, CONFIG, call, call_failing, our_timer, resource
 
 pytestmark = pytest.mark.anyio
 
 FLAKY_LIGHT = (
     "device (grouped_light) has communication issues, command (.on.on) may not have effect"
 )
-
-
-async def call(client: Client, tool: str, **arguments: Any) -> dict[str, Any]:
-    result = await client.call_tool(tool, arguments)
-    assert not result.is_error, result.content[0].text
-    return result.structured_content
-
-
-async def call_failing(client: Client, tool: str, **arguments: Any) -> str:
-    result = await client.call_tool(tool, arguments)
-    assert result.is_error
-    return result.content[0].text
-
-
-def our_timer(minutes_ago: float = 10, **changes: Any) -> dict[str, Any]:
-    started = datetime.now(UTC) - timedelta(minutes=minutes_ago)
-    return {
-        "name": "hue-mcp",
-        "description": "turn Bedroom off",
-        "command": {"address": f"/api/{APP_KEY}/groups/2/action", "method": "PUT"},
-        "localtime": "PT00:30:00",
-        "starttime": started.strftime("%Y-%m-%dT%H:%M:%S"),
-        "status": "enabled",
-        **changes,
-    }
 
 
 @pytest.fixture
@@ -384,10 +358,6 @@ async def test_tools_explain_how_to_pair_when_not_paired():
         assert "Not paired" in await call_failing(client, "get_home")
 
 
-def resource(resources: list[dict[str, Any]], resource_id: str) -> dict[str, Any]:
-    return next(r for r in resources if r["id"] == resource_id)
-
-
 @pytest.mark.parametrize(
     "change",
     [{"brightness": 30}, {"color_hex": "#ff8800"}, {"color_temperature_kelvin": 3000}],
@@ -653,10 +623,7 @@ async def test_concurrent_timers_still_respect_the_cap(fake_bridge):
 
     async def slow_bridge(request: httpx2.Request) -> httpx2.Response:
         await anyio.sleep(0.01)  # Lets the other call run in between.
-        response = fake_bridge.handle(request)
-        if request.method == "POST" and request.url.path.endswith("/schedules"):
-            fake_bridge.schedules[f"new{len(fake_bridge.schedules)}"] = our_timer()
-        return response
+        return fake_bridge.handle(request)
 
     bridge = HueBridge(CONFIG, transport=httpx2.MockTransport(slow_bridge))
     refused: list[bool] = []

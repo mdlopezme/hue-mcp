@@ -91,6 +91,9 @@ async def test_installed_command_serves_mcp_over_stdio(tmp_path):
             "set_timer",
             "list_timers",
             "cancel_timer",
+            "start_pomodoro",
+            "save_pomodoro_look",
+            "stop_pomodoro",
         }
         result = await client.call_tool("get_home", {})
         assert result.is_error

@@ -5,15 +5,17 @@ Run it before releasing a change that touches what is sent to the bridge:
     .venv/bin/python scripts/live_check.py --light "Desk"
     .venv/bin/python scripts/live_check.py --all
 
-The lights turn on, change color, play effects and are switched by timers (about four minutes
-in all). Room-level commands go through a temporary zone holding just these lights. The lights
-are restored and the zone removed at the end, even when a check fails.
+The lights turn on, change color, play effects, are switched by timers and run a short
+pomodoro (about six minutes in all). Room-level commands go through a temporary zone holding
+just these lights. The lights are restored and the zone removed at the end, even when a check
+fails.
 """
 
 import argparse
 import os
 import sys
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ from anyio import to_thread
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 
-from hue_mcp import power
+from hue_mcp import pomodoro, power
 from hue_mcp.bridge import HueBridge
 from hue_mcp.color import clamp_to_gamut, hex_to_xy
 from hue_mcp.config import load_config
@@ -256,6 +258,27 @@ async def main(light_names: list[str] | None) -> int:
             missed = [light.name for light in lights if not now[light.id]["on"]["on"]]
             expect(not missed, f"zone timer fired, but these lights missed the command: {missed}")
 
+        async def pomodoro_rounds() -> None:
+            # One-minute rounds: focus, a break at 1:00, focus again at 2:00, then stop.
+            await zone_tool("set_lights", brightness=40, color_temperature_kelvin=3000)
+
+            def focus_look(s: State) -> bool:
+                return bool(
+                    abs(s["dimming"]["brightness"] - 40) < 1
+                    and s["color_temperature"]["mirek"] == 333
+                )
+
+            await expect_each(focus_look, "focus look not set", tunable)
+            await tool(
+                "start_pomodoro", room=ZONE_NAME, focus_minutes=1, break_minutes=1, cycles=2
+            )
+            x, y = pomodoro.break_look()["xy"]
+            await anyio.sleep(62)
+            await expect_each(lambda s: _shows(s, (x, y)), "not green for the break", colorful)
+            await anyio.sleep(60)
+            await expect_each(focus_look, "focus look not back after the break", tunable)
+            await tool("stop_pomodoro")
+
         async def restore() -> str:
             """Put the lights back, checking it took: a light can miss a single command."""
             unrestored = list(lights)
@@ -293,7 +316,10 @@ async def main(light_names: list[str] | None) -> int:
             await check("room-level white tone (through a zone)", group_commands)
             await check("create, list, recall and delete a scene", scenes)
             await check("timers: set, list, cancel, and fire on lights and on a zone", timers)
+            await check("pomodoro: focus, break, focus again, stop", pomodoro_rounds)
         finally:
+            with suppress(CheckFailed):  # Ends a pomodoro a failed check left running.
+                await tool("stop_pomodoro")
             pending = await pending_timers()
             for timer_id in set(created_timers) & set(pending):
                 await tool("cancel_timer", timer_id=timer_id)

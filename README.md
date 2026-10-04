@@ -49,6 +49,7 @@ claude mcp add --scope user hue -- /absolute/path/to/hue-mcp/.venv/bin/hue-mcp
 | `activate_scene` / `create_scene` | Recall a scene, or save a room's current look as a new one |
 | `set_effect` | candle, fire, prism and other looping effects; sunrise/sunset over up to 6 h; `none` stops them |
 | `set_timer` / `list_timers` / `cancel_timer` | "Turn the bedroom off in 30 minutes", run by the bridge |
+| `start_pomodoro` / `save_pomodoro_look` / `stop_pomodoro` | Focus rounds in the room's current look, soft green breaks, run by the bridge |
 
 Good to know:
 
@@ -57,6 +58,8 @@ Good to know:
   At most 10 can be pending at once; the bridge's schedule slots are shared with other apps.
   `list_timers` counts down with this computer's clock; the bridge fires them by its own.
 - **Scenes** made with `create_scene` stay on the bridge; delete them in the Hue app.
+- **Pomodoros** save the room's look as a scene called "Pomodoro focus" and use one bridge
+  timer per switch (seven for the default four rounds), so they count toward the 10 timers.
 - **Names** match exactly or by a unique part ("living" finds "Living room"). Misspellings are
   only suggested, never acted on, and `all` must be spelled out.
 - **Partial success**: when a light in a group doesn't respond, the command still reaches the
