@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hue-mcp"
+version = "0.1.0"
+description = "MCP server that lets Claude control Philips Hue lights through a Hue Bridge"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.5,<5",
+    "httpx2>=2.13,<3",
+    "mcp>=2.2,<3",
+    "pydantic>=2.11,<3",
+    "zeroconf>=0.150,<1",
+]
+
+[project.optional-dependencies]
+# Exact pins keep lint and type results reproducible; Dependabot proposes upgrades.
+dev = [
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.10",
+]
+
+[project.scripts]
+hue-mcp = "hue_mcp.cli:main"
+
+[tool.setuptools.package-data]
+hue_mcp = ["hue_roots.pem"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "S", "PT", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-local-folder = ["conftest"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S103", "S105"]
+
+[tool.mypy]
+files = ["src", "scripts"]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["hue_mcp"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 98

@@ -1,0 +1,567 @@
+[
+ {
+  "type": "bridge_home",
+  "id": "home",
+  "id_v1": "/groups/0",
+  "children": [
+   {
+    "rid": "room-living",
+    "rtype": "room"
+   },
+   {
+    "rid": "dev-desk",
+    "rtype": "device"
+   }
+  ],
+  "services": [
+   {
+    "rid": "gl-home",
+    "rtype": "grouped_light"
+   }
+  ]
+ },
+ {
+  "type": "grouped_light",
+  "id": "gl-home",
+  "id_v1": "/groups/0",
+  "owner": {
+   "rid": "home",
+   "rtype": "bridge_home"
+  },
+  "on": {
+   "on": true
+  },
+  "dimming": {
+   "brightness": 60.0
+  }
+ },
+ {
+  "type": "grouped_light",
+  "id": "gl-living",
+  "id_v1": "/groups/1",
+  "owner": {
+   "rid": "room-living",
+   "rtype": "room"
+  },
+  "on": {
+   "on": true
+  },
+  "dimming": {
+   "brightness": 72.4
+  }
+ },
+ {
+  "type": "grouped_light",
+  "id": "gl-bedroom",
+  "id_v1": "/groups/2",
+  "owner": {
+   "rid": "room-bedroom",
+   "rtype": "room"
+  },
+  "on": {
+   "on": false
+  },
+  "dimming": {
+   "brightness": 0.0
+  }
+ },
+ {
+  "type": "grouped_light",
+  "id": "gl-downstairs",
+  "id_v1": "/groups/3",
+  "owner": {
+   "rid": "zone-downstairs",
+   "rtype": "zone"
+  },
+  "on": {
+   "on": true
+  },
+  "dimming": {
+   "brightness": 72.4
+  }
+ },
+ {
+  "type": "room",
+  "id": "room-living",
+  "id_v1": "/groups/1",
+  "metadata": {
+   "name": "Living room",
+   "archetype": "living_room"
+  },
+  "children": [
+   {
+    "rid": "dev-floor",
+    "rtype": "device"
+   },
+   {
+    "rid": "dev-ceiling",
+    "rtype": "device"
+   }
+  ],
+  "services": [
+   {
+    "rid": "gl-living",
+    "rtype": "grouped_light"
+   }
+  ]
+ },
+ {
+  "type": "room",
+  "id": "room-bedroom",
+  "id_v1": "/groups/2",
+  "metadata": {
+   "name": "Bedroom",
+   "archetype": "bedroom"
+  },
+  "children": [
+   {
+    "rid": "dev-bedside",
+    "rtype": "device"
+   }
+  ],
+  "services": [
+   {
+    "rid": "gl-bedroom",
+    "rtype": "grouped_light"
+   }
+  ]
+ },
+ {
+  "type": "room",
+  "id": "room-office",
+  "id_v1": "/groups/4",
+  "metadata": {
+   "name": "Office",
+   "archetype": "office"
+  },
+  "children": [],
+  "services": []
+ },
+ {
+  "type": "zone",
+  "id": "zone-downstairs",
+  "id_v1": "/groups/3",
+  "metadata": {
+   "name": "Downstairs",
+   "archetype": "downstairs"
+  },
+  "children": [
+   {
+    "rid": "light-floor",
+    "rtype": "light"
+   },
+   {
+    "rid": "light-ceiling",
+    "rtype": "light"
+   }
+  ],
+  "services": [
+   {
+    "rid": "gl-downstairs",
+    "rtype": "grouped_light"
+   }
+  ]
+ },
+ {
+  "type": "device",
+  "id": "dev-floor",
+  "metadata": {
+   "name": "Floor lamp",
+   "archetype": "sultan_bulb"
+  },
+  "product_data": {
+   "model_id": "LCA001"
+  },
+  "services": [
+   {
+    "rid": "light-floor",
+    "rtype": "light"
+   },
+   {
+    "rid": "zc-dev-floor",
+    "rtype": "zigbee_connectivity"
+   }
+  ]
+ },
+ {
+  "type": "device",
+  "id": "dev-ceiling",
+  "metadata": {
+   "name": "Ceiling",
+   "archetype": "sultan_bulb"
+  },
+  "product_data": {
+   "model_id": "LTW001"
+  },
+  "services": [
+   {
+    "rid": "light-ceiling",
+    "rtype": "light"
+   },
+   {
+    "rid": "zc-dev-ceiling",
+    "rtype": "zigbee_connectivity"
+   }
+  ]
+ },
+ {
+  "type": "device",
+  "id": "dev-bedside",
+  "metadata": {
+   "name": "Bedside",
+   "archetype": "sultan_bulb"
+  },
+  "product_data": {
+   "model_id": "LCT001"
+  },
+  "services": [
+   {
+    "rid": "light-bedside",
+    "rtype": "light"
+   },
+   {
+    "rid": "zc-dev-bedside",
+    "rtype": "zigbee_connectivity"
+   }
+  ]
+ },
+ {
+  "type": "device",
+  "id": "dev-desk",
+  "metadata": {
+   "name": "Desk lamp",
+   "archetype": "sultan_bulb"
+  },
+  "product_data": {
+   "model_id": "LWB010"
+  },
+  "services": [
+   {
+    "rid": "light-desk",
+    "rtype": "light"
+   },
+   {
+    "rid": "zc-dev-desk",
+    "rtype": "zigbee_connectivity"
+   }
+  ]
+ },
+ {
+  "type": "zigbee_connectivity",
+  "id": "zc-dev-floor",
+  "owner": {
+   "rid": "dev-floor",
+   "rtype": "device"
+  },
+  "status": "connected"
+ },
+ {
+  "type": "zigbee_connectivity",
+  "id": "zc-dev-ceiling",
+  "owner": {
+   "rid": "dev-ceiling",
+   "rtype": "device"
+  },
+  "status": "connected"
+ },
+ {
+  "type": "zigbee_connectivity",
+  "id": "zc-dev-bedside",
+  "owner": {
+   "rid": "dev-bedside",
+   "rtype": "device"
+  },
+  "status": "connected"
+ },
+ {
+  "type": "zigbee_connectivity",
+  "id": "zc-dev-desk",
+  "owner": {
+   "rid": "dev-desk",
+   "rtype": "device"
+  },
+  "status": "connectivity_issue"
+ },
+ {
+  "type": "light",
+  "id": "light-floor",
+  "id_v1": "/lights/1",
+  "owner": {
+   "rid": "dev-floor",
+   "rtype": "device"
+  },
+  "metadata": {
+   "name": "Hue light",
+   "archetype": "sultan_bulb",
+   "function": "mixed"
+  },
+  "on": {
+   "on": true
+  },
+  "dimming": {
+   "brightness": 80.0,
+   "min_dim_level": 0.2
+  },
+  "mode": "normal",
+  "color": {
+   "xy": {
+    "x": 0.4573,
+    "y": 0.41
+   },
+   "gamut": {
+    "red": {
+     "x": 0.6915,
+     "y": 0.3083
+    },
+    "green": {
+     "x": 0.17,
+     "y": 0.7
+    },
+    "blue": {
+     "x": 0.1532,
+     "y": 0.0475
+    }
+   },
+   "gamut_type": "C"
+  },
+  "color_temperature": {
+   "mirek": 370,
+   "mirek_valid": true,
+   "mirek_schema": {
+    "mirek_minimum": 153,
+    "mirek_maximum": 500
+   }
+  },
+  "effects_v2": {
+   "status": {
+    "effect": "no_effect",
+    "effect_values": [
+     "no_effect",
+     "candle",
+     "fire",
+     "prism",
+     "sparkle",
+     "opal",
+     "glisten",
+     "underwater",
+     "cosmos",
+     "sunbeam",
+     "enchant"
+    ]
+   }
+  },
+  "effects": {
+   "status": "no_effect",
+   "status_values": [
+    "no_effect",
+    "candle",
+    "fire",
+    "prism",
+    "sparkle",
+    "opal",
+    "glisten",
+    "underwater",
+    "cosmos",
+    "sunbeam",
+    "enchant"
+   ],
+   "effect": "no_effect",
+   "effect_values": [
+    "no_effect",
+    "candle",
+    "fire",
+    "prism",
+    "sparkle",
+    "opal",
+    "glisten",
+    "underwater",
+    "cosmos",
+    "sunbeam",
+    "enchant"
+   ]
+  },
+  "timed_effects": {
+   "effect": "no_effect",
+   "status": "no_effect",
+   "effect_values": [
+    "no_effect",
+    "sunrise",
+    "sunset"
+   ],
+   "status_values": [
+    "no_effect",
+    "sunrise",
+    "sunset"
+   ]
+  }
+ },
+ {
+  "type": "light",
+  "id": "light-ceiling",
+  "id_v1": "/lights/2",
+  "owner": {
+   "rid": "dev-ceiling",
+   "rtype": "device"
+  },
+  "metadata": {
+   "name": "Hue light",
+   "archetype": "sultan_bulb",
+   "function": "mixed"
+  },
+  "on": {
+   "on": true
+  },
+  "dimming": {
+   "brightness": 64.8,
+   "min_dim_level": 0.2
+  },
+  "mode": "normal",
+  "color_temperature": {
+   "mirek": 233,
+   "mirek_valid": true,
+   "mirek_schema": {
+    "mirek_minimum": 153,
+    "mirek_maximum": 454
+   }
+  }
+ },
+ {
+  "type": "light",
+  "id": "light-bedside",
+  "id_v1": "/lights/3",
+  "owner": {
+   "rid": "dev-bedside",
+   "rtype": "device"
+  },
+  "metadata": {
+   "name": "Hue light",
+   "archetype": "sultan_bulb",
+   "function": "mixed"
+  },
+  "on": {
+   "on": false
+  },
+  "dimming": {
+   "brightness": 40.0,
+   "min_dim_level": 0.2
+  },
+  "mode": "normal",
+  "color": {
+   "xy": {
+    "x": 0.2,
+    "y": 0.1
+   },
+   "gamut": {
+    "red": {
+     "x": 0.675,
+     "y": 0.322
+    },
+    "green": {
+     "x": 0.409,
+     "y": 0.518
+    },
+    "blue": {
+     "x": 0.167,
+     "y": 0.04
+    }
+   },
+   "gamut_type": "B"
+  },
+  "color_temperature": {
+   "mirek": null,
+   "mirek_valid": false,
+   "mirek_schema": {
+    "mirek_minimum": 153,
+    "mirek_maximum": 500
+   }
+  },
+  "effects": {
+   "status": "candle",
+   "status_values": [
+    "no_effect",
+    "candle"
+   ],
+   "effect": "candle",
+   "effect_values": [
+    "no_effect",
+    "candle"
+   ]
+  }
+ },
+ {
+  "type": "light",
+  "id": "light-desk",
+  "id_v1": "/lights/4",
+  "owner": {
+   "rid": "dev-desk",
+   "rtype": "device"
+  },
+  "metadata": {
+   "name": "Hue light",
+   "archetype": "sultan_bulb",
+   "function": "mixed"
+  },
+  "on": {
+   "on": false
+  },
+  "dimming": {
+   "brightness": 100.0,
+   "min_dim_level": 0.2
+  },
+  "mode": "normal"
+ },
+ {
+  "type": "scene",
+  "id": "scene-relax-living",
+  "id_v1": "/scenes/AbCdEf123456789",
+  "metadata": {
+   "name": "Relax"
+  },
+  "group": {
+   "rid": "room-living",
+   "rtype": "room"
+  },
+  "actions": [],
+  "speed": 0.6,
+  "auto_dynamic": false,
+  "status": {
+   "active": "inactive"
+  }
+ },
+ {
+  "type": "scene",
+  "id": "scene-movie-living",
+  "id_v1": "/scenes/MoViE123456789a",
+  "metadata": {
+   "name": "Movie"
+  },
+  "group": {
+   "rid": "room-living",
+   "rtype": "room"
+  },
+  "actions": [],
+  "speed": 0.6,
+  "auto_dynamic": false,
+  "status": {
+   "active": "inactive"
+  }
+ },
+ {
+  "type": "scene",
+  "id": "scene-relax-bedroom",
+  "id_v1": "/scenes/ReLaXbEd1234567",
+  "metadata": {
+   "name": "Relax"
+  },
+  "group": {
+   "rid": "room-bedroom",
+   "rtype": "room"
+  },
+  "actions": [],
+  "speed": 0.6,
+  "auto_dynamic": false,
+  "status": {
+   "active": "inactive"
+  }
+ }
+]
