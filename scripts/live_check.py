@@ -79,6 +79,14 @@ async def main(light_name: str) -> int:
                     return now
                 await anyio.sleep(0.5)
 
+        async def restore() -> str:
+            """Put the light back, checking it took: a light can miss a single command."""
+            for _ in range(2):
+                await bridge.update("light", light.id, _restoring(original))
+                if _looks_like(await settled(lambda s: _looks_like(s, original)), original):
+                    return f"Restored {light.name}."
+            return f"Couldn't restore {light.name}; it was: {_restoring(original)}"
+
         async def check(description: str, steps: Callable[[], Awaitable[None]]) -> None:
             try:
                 await steps()
@@ -218,11 +226,16 @@ async def main(light_name: str) -> int:
                 "set_timer", target=ZONE_NAME, target_type="zone", minutes=1.5, action="on"
             )
             created_timers.extend([light_off["timer_id"], zone_on["timer_id"]])
+            # Each timer is checked twice: did the bridge fire it, and did the light obey?
             await anyio.sleep(65)
-            expect(not (await state())["on"]["on"], "the light's timer did not turn it off")
+            fired = light_off["timer_id"] not in await pending_timers()
+            expect(fired, "the bridge didn't fire the light's timer")
+            missed = "the bridge fired the {} timer, but the light missed its command"
+            expect(not (await state())["on"]["on"], missed.format("light's"))
             await anyio.sleep(30)
-            expect((await state())["on"]["on"], "the zone's timer did not turn the light on")
-            expect(not await pending_timers(), "timers still pending after firing")
+            fired = zone_on["timer_id"] not in await pending_timers()
+            expect(fired, "the bridge didn't fire the zone's timer")
+            expect((await state())["on"]["on"], missed.format("zone's"))
 
         zone = {
             "type": "zone",
@@ -250,8 +263,7 @@ async def main(light_name: str) -> int:
             for timer_id in set(created_timers) & set(pending):
                 await tool("cancel_timer", timer_id=timer_id)
             await bridge.delete("zone", zone_id)
-            await bridge.update("light", light.id, _restoring(original))
-            print(f"Restored {light.name} and removed the test zone.")
+            print(f"Removed the test zone. {await restore()}")
 
     print(f"\n{'All checks passed.' if not failures else f'FAILED: {failures}'}")
     return 1 if failures else 0
@@ -263,6 +275,24 @@ def _effect_now(light: dict[str, Any]) -> str | None:
     older = light.get("effects", {}).get("status")
     effect: str | None = newer or older
     return effect
+
+
+def _looks_like(now: dict[str, Any], original: dict[str, Any]) -> bool:
+    if now["on"]["on"] != original["on"]["on"]:
+        return False
+    if (
+        "dimming" in original
+        and abs(now["dimming"]["brightness"] - original["dimming"]["brightness"]) > 1
+    ):
+        return False
+    color_temperature = original.get("color_temperature")
+    if color_temperature and color_temperature["mirek_valid"]:
+        return bool(now["color_temperature"]["mirek"] == color_temperature["mirek"])
+    if "color" in original:
+        x, y = original["color"]["xy"]["x"], original["color"]["xy"]["y"]
+        shown = now["color"]["xy"]
+        return bool(abs(shown["x"] - x) < 0.01 and abs(shown["y"] - y) < 0.01)
+    return True
 
 
 def _restoring(original: dict[str, Any]) -> dict[str, Any]:
