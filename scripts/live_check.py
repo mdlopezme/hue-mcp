@@ -30,6 +30,8 @@ from hue_mcp.home import Home, Light
 
 SCENE_NAME = "hue-mcp live check"
 ZONE_NAME = "hue-mcp live check"
+# The bridge reports a light's state as the light catches up, so reads can be mid-change.
+SETTLE_S = 6
 
 
 class CheckFailed(Exception):
@@ -67,6 +69,15 @@ async def main(light_name: str) -> int:
             resources = await bridge.get_resources()
             return next(r for r in resources if r["id"] == light.id)
 
+        async def settled(condition: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+            """The light's state once `condition` holds, or as it is after SETTLE_S."""
+            deadline = anyio.current_time() + SETTLE_S
+            while True:
+                now = await state()
+                if condition(now) or anyio.current_time() > deadline:
+                    return now
+                await anyio.sleep(0.5)
+
         async def check(description: str, steps: Callable[[], Awaitable[None]]) -> None:
             try:
                 await steps()
@@ -95,35 +106,42 @@ async def main(light_name: str) -> int:
             await tool(
                 "set_lights", target=light.label, brightness=40, color_temperature_kelvin=2700
             )
-            await anyio.sleep(1.5)
-            now = await state()
+            now = await settled(
+                lambda s: (
+                    abs(s["dimming"]["brightness"] - 40) < 1
+                    and s["color_temperature"]["mirek"] == 370
+                )
+            )
             expect(now["on"]["on"], "light is off")
             expect(abs(now["dimming"]["brightness"] - 40) < 1, f"brightness {now['dimming']}")
             expect(now["color_temperature"]["mirek"] == 370, f"ct {now['color_temperature']}")
 
         async def color() -> None:
             await tool("set_lights", target=light.label, color_hex="#ff8800")
-            await anyio.sleep(1.5)
             x, y = clamp_to_gamut(hex_to_xy("#ff8800"), light.gamut)
-            xy = (await state())["color"]["xy"]
-            expect(abs(xy["x"] - x) < 0.01 and abs(xy["y"] - y) < 0.01, f"xy {xy}")
+
+            def shows_color(s: dict[str, Any]) -> bool:
+                shown_x: float = s["color"]["xy"]["x"]
+                shown_y: float = s["color"]["xy"]["y"]
+                return abs(shown_x - x) < 0.01 and abs(shown_y - y) < 0.01
+
+            now = await settled(shows_color)
+            expect(shows_color(now), f"xy {now['color']['xy']}")
 
         async def looping_effect() -> None:
             await tool("set_effect", target=light.label, effect="candle")
-            await anyio.sleep(2)
-            effect = _effect_now(await state())
+            effect = _effect_now(await settled(lambda s: _effect_now(s) == "candle"))
             expect(effect == "candle", f"effect {effect}")
             await tool("set_effect", target=light.label, effect="none")
-            await anyio.sleep(1.5)
-            effect = _effect_now(await state())
+            effect = _effect_now(await settled(lambda s: _effect_now(s) == "no_effect"))
             expect(effect == "no_effect", f"effect after none: {effect}")
 
         async def sunrise() -> None:
             await tool("set_lights", target=light.label, on=False)
             await anyio.sleep(1.5)
             await tool("set_effect", target=light.label, effect="sunrise", duration_minutes=1)
-            await anyio.sleep(2)
-            status = (await state())["timed_effects"]["status"]
+            now = await settled(lambda s: s["timed_effects"]["status"] == "sunrise")
+            status = now["timed_effects"]["status"]
             expect(status == "sunrise", f"timed effect {status}")
             await tool("set_effect", target=light.label, effect="none")
 
@@ -145,10 +163,10 @@ async def main(light_name: str) -> int:
                 scenes = (await tool("get_home", room=room))["rooms_and_zones"][0]["scenes"]
                 expect(SCENE_NAME in scenes, f"scene missing from {scenes}")
                 await tool("set_lights", target=light.label, on=False)
-                await anyio.sleep(1.5)
+                await settled(lambda s: not s["on"]["on"])
                 await tool("activate_scene", scene=SCENE_NAME, room=room)
-                await anyio.sleep(1.5)
-                expect((await state())["on"]["on"], "scene recall left the light off")
+                now = await settled(lambda s: s["on"]["on"])
+                expect(now["on"]["on"], "scene recall left the light off")
             finally:
                 for scene in Home(await bridge.get_resources()).scenes:
                     if scene.name == SCENE_NAME:
@@ -162,8 +180,13 @@ async def main(light_name: str) -> int:
                 brightness=35,
                 color_temperature_kelvin=3000,
             )
-            await anyio.sleep(1.5)
-            now = await state()
+            now = await settled(
+                lambda s: (
+                    s["on"]["on"]
+                    and abs(s["dimming"]["brightness"] - 35) < 1
+                    and s["color_temperature"]["mirek"] == 333
+                )
+            )
             expect(now["on"]["on"], "light is off")
             expect(abs(now["dimming"]["brightness"] - 35) < 1, f"brightness {now['dimming']}")
             expect(now["color_temperature"]["mirek"] == 333, f"ct {now['color_temperature']}")
