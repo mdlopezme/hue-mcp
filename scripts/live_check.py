@@ -22,6 +22,7 @@ from anyio import to_thread
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 
+from hue_mcp import power
 from hue_mcp.bridge import HueBridge
 from hue_mcp.color import clamp_to_gamut, hex_to_xy
 from hue_mcp.config import load_config
@@ -101,6 +102,16 @@ async def main(light_name: str) -> int:
             described += home.get("lights_not_in_a_room", [])
             names = [lt["name"] for lt in described]
             expect(light.name in names, f"{light.name} not in {names}")
+
+        async def power_budget() -> None:
+            watts = round(power.watts_at(light, 50), 2)
+            result = await tool("set_power", target=light.label, watts=watts)
+            expect(abs(result["brightness"] - 50) < 1, f"set_power chose {result['brightness']}%")
+            now = await settled(
+                lambda s: s["on"]["on"] and abs(s["dimming"]["brightness"] - 50) < 2
+            )
+            expect(now["on"]["on"], "light is off")
+            expect(abs(now["dimming"]["brightness"] - 50) < 2, f"brightness {now['dimming']}")
 
         async def white_tone() -> None:
             await tool(
@@ -223,6 +234,7 @@ async def main(light_name: str) -> int:
             await check("mDNS discovery finds the paired bridge", discovery)
             await check("get_home lists the light", listing)
             await check("brightness and white tone", white_tone)
+            await check("power budget", power_budget)
             if light.supports_color:
                 await check("color", color)
             if "candle" in light.effects:

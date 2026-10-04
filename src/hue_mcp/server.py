@@ -10,6 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from hue_mcp import power
 from hue_mcp.bridge import HueBridge
 from hue_mcp.color import (
     GAMUT_C,
@@ -27,7 +28,9 @@ Controls the user's Philips Hue lights through their Hue Bridge.
 Call get_home first to learn the names of rooms, zones, lights and scenes. When an error
 lists several matches, repeat the call with one of them exactly as written (or its id).
 Brightness is a percentage. For a gradual change ("fade off over 20 minutes") use
-transition_seconds; for a delayed one ("turn off in 30 minutes") use set_timer."""
+transition_seconds; for a delayed one ("turn off in 30 minutes") use set_timer.
+For a power budget ("use 20 watts") use set_power. Watts are estimates from the bulbs'
+ratings, since Hue bulbs don't report what they draw; say so when quoting them."""
 
 TIMER_SCHEDULE_NAME = "hue-mcp"  # Marks the bridge schedules this server created.
 MAX_ACTIVE_TIMERS = 10  # The bridge has about 100 schedule slots, shared with other apps.
@@ -106,6 +109,7 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         }
         if loose := [_describe_light(light) for light in home.lights if light.room is None]:
             result["lights_not_in_a_room"] = loose
+        result["estimated_watts"] = _total_watts(home.lights)
         return result
 
     @server.tool()
@@ -203,6 +207,53 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         else:
             warnings = await bridge.update("grouped_light", target_item.grouped_light["id"], body)
         return _with_warnings({"target": target_item.label, "applied": applied}, notes + warnings)
+
+    @server.tool()
+    async def set_power(
+        watts: Annotated[
+            float, Field(gt=0, le=1000, description="Total draw for the target's lights.")
+        ],
+        target: Target = "all",
+        target_type: TargetTypeArg = None,
+        transition_seconds: TransitionSeconds = None,
+    ) -> dict[str, Any]:
+        """Light the target with about this many watts in total, e.g. "use 20 watts".
+
+        Every light in the target is turned on at the same brightness; colors and white tones
+        stay as they are.
+        """
+        bridge, home = await load_home()
+        target_item = home.find_target(target, target_type)
+        lights = [target_item] if isinstance(target_item, Light) else target_item.lights
+        if cannot_dim := [light.label for light in lights if "dimming" not in light.resource]:
+            raise HueError(f"set_power needs lights that dim; {', '.join(cannot_dim)} can't.")
+        brightness = power.shared_brightness(lights, watts)
+        notes = []
+        if brightness > 100:
+            brightness = 100.0
+            most = sum(power.watts_at(light, 100) for light in lights)
+            notes.append(f"At full brightness these lights draw only about {most:.1f} W.")
+        if brightness < 1:
+            dimmest = sum(power.watts_at(light, 1) for light in lights)
+            raise HueError(
+                f"{watts:g} W can't keep {len(lights)} lights on: at their dimmest they draw "
+                f"about {dimmest:.1f} W. Use fewer lights, or turn some off."
+            )
+        brightness = round(brightness, 1)
+        body: dict[str, Any] = {"on": {"on": True}, "dimming": {"brightness": brightness}}
+        if transition_seconds is not None:
+            body["dynamics"] = {"duration": round(transition_seconds * 1000)}
+        if isinstance(target_item, Light):
+            warnings = await bridge.update("light", target_item.id, body)
+        else:
+            warnings = await bridge.update("grouped_light", target_item.grouped_light["id"], body)
+        estimated = sum(power.watts_at(light, brightness) for light in lights)
+        result = {
+            "target": target_item.label,
+            "brightness": brightness,
+            "estimated_watts": round(estimated, 1),
+        }
+        return _with_warnings(result, notes + warnings)
 
     @server.tool()
     async def activate_scene(
@@ -440,6 +491,7 @@ def _describe_light(light: Light) -> dict[str, Any]:
     state["on"] = resource["on"]["on"]
     if not state["on"]:
         return state
+    state["estimated_watts"] = round(power.current_watts(light), 1)
     brightness = resource.get("dimming", {}).get("brightness")
     if brightness is not None:
         state["brightness"] = _percent(brightness)
@@ -456,7 +508,12 @@ def _describe_light(light: Light) -> dict[str, Any]:
 
 def _describe_group(home: Home, group: Group, light_states: bool) -> dict[str, Any]:
     any_on = group.grouped_light.get("on", {}).get("on", False)
-    description: dict[str, Any] = {"name": group.name, "type": group.kind, "any_on": any_on}
+    description: dict[str, Any] = {
+        "name": group.name,
+        "type": group.kind,
+        "any_on": any_on,
+        "estimated_watts": _total_watts(group.lights),
+    }
     brightness = group.grouped_light.get("dimming", {}).get("brightness")
     if any_on and brightness is not None:
         description["brightness"] = _percent(brightness)
@@ -466,6 +523,11 @@ def _describe_group(home: Home, group: Group, light_states: bool) -> dict[str, A
         description["lights"] = [light.name for light in group.lights]
     description["scenes"] = [scene.name for scene in home.scenes if scene.group is group]
     return description
+
+
+def _total_watts(lights: list[Light]) -> float:
+    """Includes the standby draw of lights that are off."""
+    return round(sum(power.current_watts(light) for light in lights), 1)
 
 
 def _active_effect(light: Light) -> str | None:

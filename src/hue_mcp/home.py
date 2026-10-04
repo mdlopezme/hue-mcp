@@ -23,6 +23,7 @@ class Light:
     reachable: bool
     resource: dict[str, Any]
     room: str | None = None
+    model_id: str | None = None
 
     @property
     def label(self) -> str:
@@ -105,15 +106,16 @@ class Home:
             if connectivity.get("status", "connected") != "connected"
         }
 
-        lights_by_id = {
-            light_id: Light(
+        lights_by_id: dict[str, Light] = {}
+        for light_id, light_resource in by_type["light"].items():
+            device = devices.get(light_resource["owner"]["rid"])
+            lights_by_id[light_id] = Light(
                 id=light_id,
-                name=_light_name(light, devices.get(light["owner"]["rid"])),
-                reachable=light["owner"]["rid"] not in unreachable_devices,
-                resource=light,
+                name=_light_name(light_resource, device),
+                reachable=light_resource["owner"]["rid"] not in unreachable_devices,
+                resource=light_resource,
+                model_id=(device or {}).get("product_data", {}).get("model_id"),
             )
-            for light_id, light in by_type["light"].items()
-        }
         self.lights = sorted(lights_by_id.values(), key=lambda light: light.name.casefold())
 
         def lights_in(group: dict[str, Any]) -> list[Light]:

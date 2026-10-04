@@ -43,8 +43,9 @@ claude mcp add --scope user hue -- /absolute/path/to/hue-mcp/.venv/bin/hue-mcp
 
 | Tool | Does |
 |---|---|
-| `get_home` | Rooms and zones, their lights' state, and their scenes |
+| `get_home` | Rooms and zones, their lights' state, their scenes, and estimated watts |
 | `set_lights` | On/off, brightness (absolute or relative), color, white tone, fades of up to 100 min |
+| `set_power` | "Use 20 watts": one brightness for every light in the target, to fit the budget |
 | `activate_scene` / `create_scene` | Recall a scene, or save a room's current look as a new one |
 | `set_effect` | candle, fire, prism and other looping effects; sunrise/sunset over up to 6 h; `none` stops them |
 | `set_timer` / `list_timers` / `cancel_timer` | "Turn the bedroom off in 30 minutes", run by the bridge |
@@ -60,6 +61,9 @@ Good to know:
   only suggested, never acted on, and `all` must be spelled out.
 - **Partial success**: when a light in a group doesn't respond, the command still reaches the
   others and Claude is told which part may not have taken effect.
+- **Watts are estimates.** Hue bulbs don't report their draw, so `get_home` and `set_power`
+  model it: about 0.5 W standby while off, rising linearly with brightness to the bulb's rating.
+  Ratings for known models are in `src/hue_mcp/power.py`; other bulbs are assumed to be 9 W.
 
 ### Permissions
 

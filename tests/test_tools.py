@@ -70,6 +70,7 @@ async def test_get_home_describes_rooms_zones_and_loose_lights(client):
         "name": "Floor lamp",
         "kind": "color",
         "on": True,
+        "estimated_watts": 7.3,
         "brightness": 80,
         "color_temperature_kelvin": 2700,
     }
@@ -679,3 +680,63 @@ async def test_a_white_tone_for_everything_names_each_light_that_cannot_follow(
         "Desk lamp (light) can't show white tones.",
         "Ceiling (light in Living room) can only go to 2200 K.",
     ]
+
+
+async def test_get_home_estimates_watts_per_light_room_and_home(client):
+    home = await call(client, "get_home")
+    bedroom, living, downstairs = home["rooms_and_zones"]
+    assert living["estimated_watts"] == 13.3  # 7.3 W + 6.0 W.
+    assert bedroom["estimated_watts"] == 0.5  # Off, on standby.
+    assert downstairs["estimated_watts"] == 13.3
+    assert "estimated_watts" not in bedroom["lights"][0]
+    assert home["estimated_watts"] == 14.3  # Every light once, standby included.
+
+
+async def test_set_power_gives_every_light_one_brightness_for_the_budget(client, fake_bridge):
+    result = await call(client, "set_power", watts=10, target="Living room")
+    assert fake_bridge.writes == [
+        (
+            "PUT",
+            "/clip/v2/resource/grouped_light/gl-living",
+            {"on": {"on": True}, "dimming": {"brightness": 52.9}},
+        )
+    ]
+    assert result == {"target": "Living room (room)", "brightness": 52.9, "estimated_watts": 10.0}
+
+
+async def test_set_power_on_one_light_uses_its_rating(client, fake_bridge, resources):
+    resource(resources, "dev-floor")["product_data"]["model_id"] = "LCA007"
+    result = await call(client, "set_power", watts=5.5, target="Floor lamp", transition_seconds=4)
+    assert fake_bridge.writes == [
+        (
+            "PUT",
+            "/clip/v2/resource/light/light-floor",
+            {"on": {"on": True}, "dimming": {"brightness": 50.0}, "dynamics": {"duration": 4000}},
+        )
+    ]
+    assert result["estimated_watts"] == 5.5
+
+
+async def test_a_budget_above_what_the_lights_can_draw_means_full_brightness(client, fake_bridge):
+    result = await call(client, "set_power", watts=100, target="Living room")
+    assert result["brightness"] == 100
+    assert result["warnings"] == ["At full brightness these lights draw only about 18.0 W."]
+
+
+async def test_a_budget_too_small_to_keep_the_lights_on_is_refused(client, fake_bridge):
+    message = await call_failing(client, "set_power", watts=1, target="Living room")
+    assert "1 W can't keep 2 lights on: at their dimmest they draw about 1.2 W" in message
+    assert fake_bridge.writes == []
+
+
+async def test_set_power_needs_lights_that_dim(client, fake_bridge, resources):
+    del resource(resources, "light-desk")["dimming"]
+    message = await call_failing(client, "set_power", watts=3, target="Desk lamp")
+    assert "set_power needs lights that dim; Desk lamp (light) can't." in message
+    assert fake_bridge.writes == []
+
+
+@pytest.mark.parametrize("watts", [0, 1001])
+async def test_set_power_checks_the_budget(client, fake_bridge, watts):
+    await call_failing(client, "set_power", watts=watts)
+    assert fake_bridge.writes == []

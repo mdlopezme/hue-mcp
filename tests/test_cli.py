@@ -84,6 +84,7 @@ async def test_installed_command_serves_mcp_over_stdio(tmp_path):
         assert tools == {
             "get_home",
             "set_lights",
+            "set_power",
             "activate_scene",
             "create_scene",
             "set_effect",
