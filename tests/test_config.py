@@ -3,7 +3,15 @@ import stat
 
 import pytest
 
-from hue_mcp.config import config_path, load_config, save_config
+from hue_mcp.config import (
+    Location,
+    config_path,
+    load_config,
+    load_location,
+    location_path,
+    save_config,
+    save_location,
+)
 from hue_mcp.errors import HueError
 
 from conftest import CONFIG
@@ -94,3 +102,38 @@ def test_a_config_folder_that_cannot_be_entered_is_reported_not_missed():
             load_config()
     finally:
         config_path().parent.chmod(0o700)
+
+
+PLACE = Location(latitude=38.72, longitude=-9.14, label="Lisbon, Portugal")
+
+
+def test_no_location_until_one_is_set():
+    assert load_location() is None
+
+
+def test_the_location_round_trips_privately():
+    save_location(PLACE)
+    assert load_location() == PLACE
+    assert mode(location_path()) == 0o600
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        '{"latitude": 38.7}',
+        '{"latitude": 91, "longitude": 0, "label": "x"}',
+        '{"latitude": 0, "longitude": -181, "label": "x"}',
+        '{"latitude": "north", "longitude": 0, "label": "x"}',
+        '{"latitude": true, "longitude": 0, "label": "x"}',
+        '{"latitude": NaN, "longitude": 0, "label": "x"}',
+        '{"latitude": 1e400, "longitude": 0, "label": "x"}',
+        '{"latitude": 1' + "0" * 400 + ', "longitude": 0, "label": "x"}',  # Overflows a float.
+        '{"latitude": 0, "longitude": 0, "label": 7}',
+    ],
+)
+def test_an_unusable_location_says_how_to_fix_it(content):
+    location_path().parent.mkdir(parents=True)
+    location_path().write_text(content)
+    with pytest.raises(HueError, match="set-location"):
+        load_location()

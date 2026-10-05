@@ -12,6 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.5,<5",
+    "astral>=3.2,<4",
     "httpx2>=2.13,<3",
     "mcp>=2.2,<3",
     "pydantic>=2.11,<3",
