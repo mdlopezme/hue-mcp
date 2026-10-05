@@ -137,7 +137,13 @@ def band(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime_dir: Path) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    for constant in ("SETTLE_INTERVAL_S", "PULSE_HOLD_S", "DIP_HOLD_S"):
+    for constant in (
+        "SETTLE_INTERVAL_S",
+        "PULSE_HOLD_S",
+        "DIP_HOLD_S",
+        "PULSE_BACK_S",
+        "DIP_BACK_S",
+    ):
         monkeypatch.setattr(watcher_module, constant, 0)
     save_location(PLACE)
 
@@ -842,17 +848,19 @@ async def test_a_break_turning_to_waiting_keeps_a_change_made_at_the_switch(harn
     assert w.session is None
 
 
-async def test_a_red_pulse_fades_back_with_the_scene_alone(harness):
+async def test_red_pulses_run_back_to_back_each_fading_back_with_the_scene(harness):
     live = harness.live
     async with anyio.create_task_group() as tg:
         await waiting(harness, tg)
         before = len(live.writes)
-        await harness.tick_through(10, tg, idle=True)
-    pulse = [(path.rsplit("/", 2)[-2], body) for _, path, body in live.writes[before:]]
-    assert pulse == [
+        await harness.tick_through(12, tg, idle=True)
+    pulses = [(path.rsplit("/", 2)[-2], body) for _, path, body in live.writes[before:]]
+    red_and_back = [
         ("grouped_light", looks.red_pulse_body()),
         ("scene", {"recall": {"action": "active", "duration": 2000}}),
     ]
+    assert len(pulses) >= 4
+    assert pulses == red_and_back * (len(pulses) // 2)
 
 
 async def test_a_pulse_that_couldnt_get_back_is_restored_later(harness):

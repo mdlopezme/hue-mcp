@@ -158,12 +158,12 @@ def test_focus_has_no_nudges():
         assert s.due_nudge(now, active(now)) is None
 
 
-def test_red_pulses_start_ten_seconds_into_waiting_then_every_thirty():
+def test_red_pulses_start_ten_seconds_into_waiting_then_run_back_to_back():
     s = waiting()
     t0 = s.phase_started
     away = idle_since(t0 - 60)
-    played = [now - t0 for now in range(int(t0), int(t0) + 75) if s.due_nudge(now, away)]
-    assert played == [10, 40, 70]
+    played = [now - t0 for now in range(int(t0), int(t0) + 15) if s.due_nudge(now, away)]
+    assert played == [10, 11, 12, 13, 14]  # The watcher plays each once the last is over.
 
 
 def in_break(short_s: float = SHORT) -> Session:

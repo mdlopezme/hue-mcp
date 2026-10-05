@@ -81,9 +81,9 @@ the room's lights:
   warming as the day goes.
 - **Short breaks** are greens (5 minutes), and the **long break** after the last round is violet
   (30 minutes). At night both turn dimmer and warmer.
-- **When a break ends and you're away from the computer**, the room keeps the break look and
-  pulses red every 30 seconds. The next round starts when you're back: a mouse move or a key
-  press. If you keep working through a break, the lights breathe brighter to send you off, and
+- **When a break ends and you're away from the computer**, the room keeps the break colors and
+  breathes to dim red and back, over and over, until you're back: your first mouse move or key
+  press starts the next round. If you keep working through a break, the lights breathe brighter to send you off, and
   a minute before a break ends they dip as a heads-up (breaks of two minutes or less skip both).
 - **A session ends** when you ask Claude to stop it; when someone changes the room's lights at
   the switch or in the Hue app while it waits for you (the lights stay as they set them); or

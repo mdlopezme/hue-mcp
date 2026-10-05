@@ -483,8 +483,8 @@ def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watc
         """Start an adaptive pomodoro, run by the pomodoro watcher on the user's computer.
 
         Focus looks follow the time of day; breaks are green, the long break violet. When a
-        break ends with the user away from the computer, the room waits, pulsing red, and the
-        next round starts when they're back. A new pomodoro replaces one that is running.
+        break ends with the user away from the computer, the room keeps pulsing red until
+        they're back, and that starts the next round. A new pomodoro replaces one that is running.
         """
         result = await ask(
             "start",

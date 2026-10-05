@@ -41,6 +41,9 @@ class FakeBridge:
             return httpx2.Response(200, json={"errors": [], "data": self.resources})
         if path.startswith("/clip/v2/resource/"):
             rtype, _, rid = path.removeprefix("/clip/v2/resource/").partition("/")
+            if request.method == "GET" and not rid:
+                of_type = [r for r in self.resources if r["type"] == rtype]
+                return httpx2.Response(200, json={"errors": [], "data": of_type})
             if request.method == "POST":
                 rid = f"new-{rtype}-{len(self.resources)}"
                 self.resources.append({**body, "id": rid, "id_v1": f"/{rtype}s/V1{rid}"})

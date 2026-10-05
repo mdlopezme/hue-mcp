@@ -19,7 +19,7 @@ PHASES: tuple[Phase, ...] = ("focus", "short_break", "long_break", "waiting")
 Nudge = Literal["red", "breath", "dip"]
 
 IDLE_TIMEOUT_S = 5.0  # The compositor reports idle after this long without input.
-RED_AFTER_S = 10.0  # Into waiting, before the first red pulse.
+RED_AFTER_S = 10.0  # Into waiting, before the first red pulse; then they run back to back.
 NUDGE_EVERY_S = 30.0
 BREATH_AFTER_S = 60.0  # Into a break before "take your break", to let the user wrap up.
 DIP_BEFORE_END_S = 60.0
@@ -181,7 +181,8 @@ class Session:
         if self.phase == "waiting":
             if now - self.phase_started < RED_AFTER_S:
                 return None
-            return self._every("red", now)
+            self.last_nudge = now
+            return "red"  # The watcher starts each one once the last is over.
         deadline = self.deadline()
         if self.phase == "focus" or deadline is None:
             return None

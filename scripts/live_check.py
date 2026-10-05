@@ -344,10 +344,9 @@ async def main(light_names: list[str] | None) -> int:
                 await at(112)  # A minute before the break ends: the dip.
                 expect(nudges("down") == 1, f"{nudges('down')} dips instead of one")
                 await expect_each(await shows_scene("Pomodoro short break"), "no look after dip")
-                await at(183)  # The break ended at 165 s: waiting, red 10 s later.
+                await at(183)  # The break ended at 165 s: waiting, with red from 10 s later.
                 expect(phase() == "waiting", f"in {phase()} after the break, not waiting")
-                expect(nudges("red") >= 1, "no red pulse while waiting")
-                await expect_each(await shows_scene("Pomodoro short break"), "no look after red")
+                expect(nudges("red") >= 2, f"{nudges('red')} red pulses, not back to back")
                 watcher.tracker.resumed()  # Back at the computer.
                 returned = anyio.current_time()
                 await at(8, returned)

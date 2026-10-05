@@ -52,6 +52,11 @@ class HueBridge:
         resources, _ = await self._v2("GET", "resource")
         return resources
 
+    async def get_lights(self) -> list[dict[str, Any]]:
+        """Only the light resources: a much smaller read than the whole home."""
+        lights, _ = await self._v2("GET", "resource/light")
+        return lights
+
     async def update(self, rtype: str, rid: str, body: dict[str, Any]) -> list[str]:
         """Returns the bridge's warnings, e.g. a light in the group that didn't respond."""
         _, warnings = await self._v2("PUT", f"resource/{rtype}/{rid}", body)

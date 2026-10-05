@@ -53,6 +53,8 @@ SAVE_EVERY_S = 60.0  # So a restart can tell how recent a saved session is.
 RESTORE_FADE_MS = 400
 PULSE_HOLD_S = looks.PULSE_FADE_MS / 1000 + 0.5  # The fade to the nudge, and a moment there.
 DIP_HOLD_S = looks.DIP_HOLD_S
+PULSE_BACK_S = looks.PULSE_FADE_MS / 1000  # A pulse ends once its fade back has.
+DIP_BACK_S = looks.DIP_FADE_MS / 1000
 RECONNECT_FIRST_S = 1.0
 RECONNECT_MAX_S = 60.0
 OFF_FADE_MS = 10_000
@@ -515,29 +517,31 @@ class Watcher:
                 self._outside_change = True
                 return
             await _resend(bridge, missed)
-        body, hold_s, back_ms = _nudge_command(nudge)
+        body, hold_s, back_ms, back_s = _nudge_command(nudge)
         self._pulse_left_look = True
         await bridge.update("grouped_light", group.grouped_light["id"], body)
         await anyio.sleep(hold_s)
+        reachable = {light.id for light in group.lights if light.reachable}
         if nudge == "red" and self._switched_off_meanwhile(
-            Home(await bridge.get_resources()), session
+            await bridge.get_lights(), _scene_actions(scene), reachable
         ):
             self._outside_change = True
             return
         recall = {"recall": {"action": "active", "duration": back_ms}}
         await bridge.update("scene", scene.id, recall)
         self._pulse_left_look = False
+        await anyio.sleep(back_s)
 
-    def _switched_off_meanwhile(self, home: Home, session: Session) -> bool:
+    def _switched_off_meanwhile(
+        self, lights: list[dict[str, Any]], wanted: dict[str, dict[str, Any]], reachable: set[str]
+    ) -> bool:
         """Mid-pulse, lights are anywhere between the look and red, so only on and off tell."""
-        group = _room(home, session.room_id)
-        if group is None:
-            return True
-        wanted = _scene_actions(_find_scene(home, group, session.look))
         return any(
-            light.resource["on"]["on"] != wanted[light.id].get("on", {}).get("on", True)
-            for light in group.lights
-            if light.id in wanted and light.reachable and light.id not in self._changed_by_claude
+            light["on"]["on"] != wanted[light["id"]].get("on", {}).get("on", True)
+            for light in lights
+            if light["id"] in wanted
+            and light["id"] in reachable
+            and light["id"] not in self._changed_by_claude
         )
 
     async def _cancel_pulse(self, restore: bool) -> None:
@@ -799,13 +803,16 @@ def _task_light(home: Home, group: Group, name: str | None) -> Light | None:
     return light
 
 
-def _nudge_command(nudge: Nudge) -> tuple[dict[str, Any], float, int]:
-    """The grouped_light command, how long to hold it, and the fade back to the look."""
+def _nudge_command(nudge: Nudge) -> tuple[dict[str, Any], float, int, float]:
+    """The grouped_light command, how long to hold it, and the fade back to the look (in ms
+    for the bridge, and in seconds to wait it out)."""
     if nudge == "red":
-        return looks.red_pulse_body(), PULSE_HOLD_S, looks.PULSE_FADE_MS
+        return looks.red_pulse_body(), PULSE_HOLD_S, looks.PULSE_FADE_MS, PULSE_BACK_S
     if nudge == "breath":
-        return _brightness_step("up", looks.PULSE_FADE_MS), PULSE_HOLD_S, looks.PULSE_FADE_MS
-    return _brightness_step("down", looks.DIP_FADE_MS), DIP_HOLD_S, looks.DIP_FADE_MS
+        breath = _brightness_step("up", looks.PULSE_FADE_MS)
+        return breath, PULSE_HOLD_S, looks.PULSE_FADE_MS, PULSE_BACK_S
+    dip = _brightness_step("down", looks.DIP_FADE_MS)
+    return dip, DIP_HOLD_S, looks.DIP_FADE_MS, DIP_BACK_S
 
 
 def _brightness_step(direction: Literal["up", "down"], fade_ms: int) -> dict[str, Any]:
