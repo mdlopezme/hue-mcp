@@ -6,7 +6,7 @@ Run it before releasing a change that touches what is sent to the bridge:
     .venv/bin/python scripts/live_check.py --all
 
 The lights turn on, change color, play effects, are switched by timers and run a short
-pomodoro (about six minutes in all). Room-level commands go through a temporary zone holding
+pomodoro (about eight minutes in all). Room-level commands go through a temporary zone holding
 just these lights. The lights are restored and the zone removed at the end, even when a check
 fails.
 """
@@ -14,8 +14,8 @@ fails.
 import argparse
 import os
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -24,13 +24,14 @@ from anyio import to_thread
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 
-from hue_mcp import pomodoro, power
+from hue_mcp import looks, power
 from hue_mcp.bridge import HueBridge
 from hue_mcp.color import clamp_to_gamut, hex_to_xy
-from hue_mcp.config import load_config
+from hue_mcp.config import load_config, load_location
 from hue_mcp.discovery import discover_lan_bridges
 from hue_mcp.home import Home, Light
 from hue_mcp.server import MAX_ACTIVE_TIMERS
+from hue_mcp.watcher import TICK_S, Watcher, boot_clock
 
 SCENE_NAME = "hue-mcp live check"
 ZONE_NAME = "hue-mcp live check"
@@ -258,26 +259,115 @@ async def main(light_names: list[str] | None) -> int:
             missed = [light.name for light in lights if not now[light.id]["on"]["on"]]
             expect(not missed, f"zone timer fired, but these lights missed the command: {missed}")
 
+        async def shows_scene(name: str) -> Callable[[State], bool]:
+            home = Home(await bridge.get_resources())
+            [scene] = [s for s in home.scenes if s.group.name == ZONE_NAME and s.name == name]
+            actions = {a["target"]["rid"]: a["action"] for a in scene.resource["actions"]}
+            return lambda s: looks.shows(s, actions[s["id"]])
+
         async def pomodoro_rounds() -> None:
-            # One-minute rounds: focus, a break at 1:00, focus again at 2:00, then stop.
-            await zone_tool("set_lights", brightness=40, color_temperature_kelvin=3000)
+            """The watcher's own logic on the real lights, with second-long phases and the
+            user's activity played by this script. Its state goes to a scratch folder."""
+            if load_location() is None:
+                raise CheckFailed('no location; run `hue-mcp set-location "<city>"` first')
+            saved_state_home = os.environ.get("XDG_STATE_HOME")
+            with tempfile.TemporaryDirectory() as scratch:
+                os.environ["XDG_STATE_HOME"] = scratch
+                try:
+                    await run_pomodoro()
+                except* CheckFailed as failures:
+                    raise failures.exceptions[0] from None
+                finally:
+                    if saved_state_home is None:
+                        os.environ.pop("XDG_STATE_HOME")
+                    else:
+                        os.environ["XDG_STATE_HOME"] = saved_state_home
 
-            def focus_look(s: State) -> bool:
-                return bool(
-                    abs(s["dimming"]["brightness"] - 40) < 1
-                    and s["color_temperature"]["mirek"] == 333
+        async def run_pomodoro() -> None:
+            shown: list[str] = []
+            sent: list[dict[str, Any]] = []  # The watcher's commands to the zone's lights.
+
+            async def notify(title: str, body: str) -> None:
+                shown.append(title)
+
+            class Recording(HueBridge):
+                async def update(self, rtype: str, rid: str, body: dict[str, Any]) -> list[str]:
+                    if rtype == "grouped_light":
+                        sent.append(body)
+                    return await super().update(rtype, rid, body)
+
+            recording = Recording(bridge.config)
+            watcher = Watcher(lambda: recording, notify=notify)
+            watcher.tracker.connected(boot_clock())
+            watcher.tracker.resumed()  # The user starts at the computer.
+
+            def nudges(kind: str) -> int:
+                if kind == "red":
+                    return sum("color" in body for body in sent)
+                return sum(body.get("dimming_delta", {}).get("action") == kind for body in sent)
+
+            def phase() -> str | None:
+                return watcher.session.phase if watcher.session else None
+
+            async def keep_ticking(task_group: Any) -> None:
+                while True:
+                    await watcher.tick(task_group)
+                    await anyio.sleep(TICK_S)
+
+            async with anyio.create_task_group() as task_group:
+                started = anyio.current_time()
+
+                async def at(seconds: float, since: float = started) -> None:
+                    await anyio.sleep(max(0.0, since + seconds - anyio.current_time()))
+
+                result = await watcher.handle(
+                    {
+                        "command": "start",
+                        "room": ZONE_NAME,
+                        "task_light": None,
+                        "focus_minutes": 0.25,
+                        "short_break_minutes": 2.5,  # Long enough for the breath and the dip.
+                        "long_break_minutes": 0.25,
+                        "rounds": 2,
+                    }
                 )
-
-            await expect_each(focus_look, "focus look not set", tunable)
-            await tool(
-                "start_pomodoro", room=ZONE_NAME, focus_minutes=1, break_minutes=1, cycles=2
-            )
-            x, y = pomodoro.break_look()["xy"]
-            await anyio.sleep(62)
-            await expect_each(lambda s: _shows(s, (x, y)), "not green for the break", colorful)
-            await anyio.sleep(60)
-            await expect_each(focus_look, "focus look not back after the break", tunable)
-            await tool("stop_pomodoro")
+                task_group.start_soon(keep_ticking, task_group)
+                focus = f"Pomodoro {result['look']}"
+                await at(8)
+                await expect_each(await shows_scene(focus), f"not showing {focus}")
+                await at(24)  # Focus ended at 15 s, with the user still working.
+                expect(phase() == "short_break", f"in {phase()} 24 s in, not the short break")
+                await expect_each(await shows_scene("Pomodoro short break"), "no break look")
+                await at(82)  # Still working 60 s into the break: a breath.
+                expect(nudges("up") >= 1, "no breath for working through the break")
+                watcher.tracker.idled(boot_clock())  # The user steps away.
+                await at(112)  # A minute before the break ends: the dip.
+                expect(nudges("down") == 1, f"{nudges('down')} dips instead of one")
+                await expect_each(await shows_scene("Pomodoro short break"), "no look after dip")
+                await at(183)  # The break ended at 165 s: waiting, red 10 s later.
+                expect(phase() == "waiting", f"in {phase()} after the break, not waiting")
+                expect(nudges("red") >= 1, "no red pulse while waiting")
+                await expect_each(await shows_scene("Pomodoro short break"), "no look after red")
+                watcher.tracker.resumed()  # Back at the computer.
+                returned = anyio.current_time()
+                await at(8, returned)
+                expect(phase() == "focus", f"in {phase()} after coming back, not focus")
+                await expect_each(await shows_scene(focus), "round 2 didn't start on return")
+                await at(10, returned)
+                watcher.tracker.idled(boot_clock())  # Away again; round 2 runs to its end.
+                await at(23, returned)
+                expect(phase() == "long_break", f"in {phase()}, not the long break")
+                await expect_each(await shows_scene("Pomodoro long break"), "no long break look")
+                await at(33, returned)  # Waiting since 30 s; someone turns a light off.
+                await bridge.update("light", lights[0].id, {"on": {"on": False}})
+                await at(48, returned)  # The red pulse at 40 s found it instead.
+                expect(watcher.session is None, "a change at the switch didn't end the session")
+                now = await states()
+                expect(not now[lights[0].id]["on"]["on"], "the switch's change was undone")
+                task_group.cancel_scope.cancel()
+            expected = ["Focus 1 of 2", "Break time", "Break's over", "Focus 2 of 2"]
+            expected += ["Long break", "Break's over", "Pomodoro ended"]
+            expect(shown == expected, f"notifications were {shown}")
 
         async def restore() -> str:
             """Put the lights back, checking it took: a light can miss a single command."""
@@ -316,10 +406,13 @@ async def main(light_names: list[str] | None) -> int:
             await check("room-level white tone (through a zone)", group_commands)
             await check("create, list, recall and delete a scene", scenes)
             await check("timers: set, list, cancel, and fire on lights and on a zone", timers)
-            await check("pomodoro: focus, break, focus again, stop", pomodoro_rounds)
+            await check(
+                "pomodoro: breaks, nudges, a return, and the switch ending it", pomodoro_rounds
+            )
         finally:
-            with suppress(CheckFailed):  # Ends a pomodoro a failed check left running.
-                await tool("stop_pomodoro")
+            for scene in Home(await bridge.get_resources()).scenes:
+                if scene.group.name == ZONE_NAME:  # The pomodoro's looks.
+                    await bridge.delete("scene", scene.id)
             pending = await pending_timers()
             for timer_id in set(created_timers) & set(pending):
                 await tool("cancel_timer", timer_id=timer_id)

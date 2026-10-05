@@ -9,7 +9,9 @@ from mcp import Client
 
 from hue_mcp.bridge import HueBridge
 from hue_mcp.config import BridgeConfig
+from hue_mcp.errors import HueError
 from hue_mcp.server import build_server
+from hue_mcp.watcher import NOT_RUNNING, WatcherNotRunning
 
 APP_KEY = "test-app-key"
 CONFIG = BridgeConfig(bridge_id="001788fffe123456", ip="192.168.1.50", app_key=APP_KEY)
@@ -60,6 +62,29 @@ class FakeBridge:
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
 
+class FakeWatcher:
+    """Stands in for the pomodoro watcher: records requests and answers from `replies`, or
+    as a watcher that isn't running."""
+
+    def __init__(self, bridge: FakeBridge):
+        self.bridge = bridge
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.writes_before: list[int] = []  # Bridge writes made before each request.
+        self.replies: dict[str, dict[str, Any] | HueError] = {}
+        self.timeouts: list[float | None] = []
+
+    async def ask(
+        self, command: str, *, timeout_s: float | None = None, **arguments: Any
+    ) -> dict[str, Any]:
+        self.requests.append((command, arguments))
+        self.timeouts.append(timeout_s)
+        self.writes_before.append(len(self.bridge.writes))
+        reply = self.replies.get(command, WatcherNotRunning(NOT_RUNNING))
+        if isinstance(reply, HueError):
+            raise reply
+        return reply
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -76,9 +101,14 @@ def fake_bridge(resources: list[dict[str, Any]]) -> FakeBridge:
 
 
 @pytest.fixture
-async def client(fake_bridge: FakeBridge):
+def fake_watcher(fake_bridge: FakeBridge) -> FakeWatcher:
+    return FakeWatcher(fake_bridge)
+
+
+@pytest.fixture
+async def client(fake_bridge: FakeBridge, fake_watcher: FakeWatcher):
     bridge = HueBridge(CONFIG, transport=httpx2.MockTransport(fake_bridge.handle))
-    async with Client(build_server(lambda: bridge)) as client:
+    async with Client(build_server(lambda: bridge, fake_watcher.ask)) as client:
         yield client
 
 

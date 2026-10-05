@@ -49,7 +49,7 @@ claude mcp add --scope user hue -- /absolute/path/to/hue-mcp/.venv/bin/hue-mcp
 | `activate_scene` / `create_scene` | Recall a scene, or save a room's current look as a new one |
 | `set_effect` | candle, fire, prism and other looping effects; sunrise/sunset over up to 6 h; `none` stops them |
 | `set_timer` / `list_timers` / `cancel_timer` | "Turn the bedroom off in 30 minutes", run by the bridge |
-| `start_pomodoro` / `save_pomodoro_look` / `stop_pomodoro` | Focus rounds in the room's current look, soft green breaks, run by the bridge |
+| `start_pomodoro` / `stop_pomodoro` / `get_pomodoro` / `save_pomodoro_look` | Adaptive focus rounds whose looks follow the sun; see [Pomodoro](#pomodoro) |
 
 Good to know:
 
@@ -58,8 +58,6 @@ Good to know:
   At most 10 can be pending at once; the bridge's schedule slots are shared with other apps.
   `list_timers` counts down with this computer's clock; the bridge fires them by its own.
 - **Scenes** made with `create_scene` stay on the bridge; delete them in the Hue app.
-- **Pomodoros** save the room's look as a scene called "Pomodoro focus" and use one bridge
-  timer per switch (seven for the default four rounds), so they count toward the 10 timers.
 - **Names** match exactly or by a unique part ("living" finds "Living room"). Misspellings are
   only suggested, never acted on, and `all` must be spelled out.
 - **Partial success**: when a light in a group doesn't respond, the command still reaches the
@@ -71,6 +69,48 @@ Good to know:
 - **Watts are estimates.** Hue bulbs don't report their draw, so `get_home` and `set_power`
   model it: about 0.5 W standby while off, rising linearly with brightness to the bulb's rating.
   Ratings for known models are in `src/hue_mcp/power.py`; other bulbs are assumed to be 9 W.
+
+## Pomodoro
+
+`start_pomodoro` runs focus rounds (25 minutes by default) with breaks between them, told apart by
+the room's lights:
+
+- **Focus** looks follow the part of the day at your location: fresh blues in the morning,
+  sunny yellows at midday, golden oranges in the afternoon, sunset rose in the evening, and a
+  dim, blue-free red at night. A task light, such as a desk lamp, stays a white to read by,
+  warming as the day goes.
+- **Short breaks** are greens (5 minutes), and the **long break** after the last round is violet
+  (30 minutes). At night both turn dimmer and warmer.
+- **When a break ends and you're away from the computer**, the room keeps the break look and
+  pulses red every 30 seconds. The next round starts when you're back: a mouse move or a key
+  press. If you keep working through a break, the lights breathe brighter to send you off, and
+  a minute before a break ends they dip as a heads-up (breaks of two minutes or less skip both).
+- **A session ends** when you ask Claude to stop it; when someone changes the room's lights at
+  the switch or in the Hue app while it waits for you (the lights stay as they set them); or
+  after two hours away (the room fades off).
+- `get_pomodoro` tells the current phase and counts the rounds completed each day. Desktop
+  notifications mark each switch.
+
+A background service, the watcher, runs the sessions: it notices when you're at the computer and
+switches the lights. It needs a Wayland compositor that offers the input idle notifications of
+`ext-idle-notify-v1` version 2 (tested on KDE Plasma 6), and it only ever learns *whether* you're
+using the computer, never what you type. Set it up once:
+
+```sh
+.venv/bin/hue-mcp set-location "Lisbon"   # where the lights are, for the sun times
+.venv/bin/hue-mcp install-watcher         # a systemd user service, started at every login;
+                                          # run it again after an update to restart it
+.venv/bin/hue-mcp watch --print-activity  # optional: check it sees you go idle and come back
+```
+
+`set-location` looks the city up once with [Open-Meteo](https://open-meteo.com/)'s free place
+search and saves its coordinates to `~/.config/hue-mcp/location.json`; the sun times are then
+computed locally. The first session in a room creates nine scenes there ("Pomodoro morning",
+"Pomodoro short break", ...). Change one in the Hue app, or ask Claude to tweak the lights
+mid-session: the change lasts until the next switch or nudge, unless `save_pomodoro_look` keeps
+it in the look showing. Naming a task light later gives it its white in the existing looks, and
+a light added to the room joins them. The watcher keeps its state and the
+rounds log in `~/.local/state/hue-mcp/`; its log is `journalctl --user -u hue-mcp-watch`.
 
 ### Permissions
 
@@ -93,7 +133,8 @@ action updates.
 The tests use a fake bridge, so they can't prove the real bridge agrees. Before releasing a
 change to what is sent to the bridge, run the hardware check. It drives every tool through the
 installed server against the lights you pick, checks what each light actually does, and puts
-them back afterwards (about four minutes; the lights change, flicker and switch on and off):
+them back afterwards (about eight minutes; the lights change, flicker and switch on and off). Its
+pomodoro step runs the watcher's logic with second-long phases, so it needs a location set:
 
 ```sh
 .venv/bin/python scripts/live_check.py --light "Desk"   # or --all, or --light repeated

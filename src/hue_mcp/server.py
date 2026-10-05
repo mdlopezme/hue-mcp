@@ -1,8 +1,7 @@
 """The MCP tools Claude uses to control the lights."""
 
-import math
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
@@ -11,7 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from hue_mcp import pomodoro, power
+from hue_mcp import power
 from hue_mcp.bridge import HueBridge
 from hue_mcp.color import (
     GAMUT_C,
@@ -22,7 +21,9 @@ from hue_mcp.color import (
     xy_to_hex,
 )
 from hue_mcp.errors import HueError
-from hue_mcp.home import NO_EFFECT, Group, Home, Light, Scene
+from hue_mcp.home import NO_EFFECT, Group, Home, Light
+from hue_mcp.looks import current_look
+from hue_mcp.watcher import WatcherNotRunning, ask_watcher
 
 INSTRUCTIONS = """\
 Controls the user's Philips Hue lights through their Hue Bridge.
@@ -32,16 +33,16 @@ Brightness is a percentage. For a gradual change ("fade off over 20 minutes") us
 transition_seconds; for a delayed one ("turn off in 30 minutes") use set_timer.
 For a power budget ("use 20 watts") use set_power. Watts are estimates from the bulbs' ratings,
 since Hue bulbs don't report what they draw; say so when quoting them.
-For focus sessions use start_pomodoro. When a result says a pomodoro is running in the room you
-changed, call save_pomodoro_look so its focus periods keep the change."""
+For focus sessions use start_pomodoro, and get_pomodoro for its progress. When a result says a
+pomodoro is running in the room you changed, the change lasts until the pomodoro's next switch
+or nudge; if the user wants to keep it, call save_pomodoro_look."""
 
 TIMER_SCHEDULE_NAME = "hue-mcp"  # Marks the bridge schedules this server created.
 MAX_ACTIVE_TIMERS = 10  # The bridge has about 100 schedule slots, shared with other apps.
 MAX_TRANSITION_S = 6000  # Signify's API caps transitions at 6,000,000 ms.
 MAX_TIMED_EFFECT_MIN = 360  # And sunrise/sunset at 21,600,000 ms.
 LIGHT_COMMAND_SPACING_S = 0.1  # The bridge handles about 10 light commands per second.
-SETTLE_TRIES = 5  # Reads, SETTLE_INTERVAL_S apart, to wait out a fade before saving a look.
-SETTLE_INTERVAL_S = 1.0
+TOUCHED_TIMEOUT_S = 3.0  # Telling the pomodoro watcher must not hold up a light change.
 
 TargetType = Literal["light", "room", "zone"]
 Effect = Literal[
@@ -86,8 +87,10 @@ TransitionSeconds = Annotated[
 
 READ_ONLY = ToolAnnotations(read_only_hint=True)
 
+AskWatcher = Callable[..., Awaitable[dict[str, Any]]]
 
-def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
+
+def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watcher) -> MCPServer:
     server = MCPServer("hue", instructions=INSTRUCTIONS)
     # Keeps concurrent set_timer calls from all passing the MAX_ACTIVE_TIMERS check.
     timer_lock = anyio.Lock()
@@ -95,6 +98,24 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
     async def load_home() -> tuple[HueBridge, Home]:
         bridge = get_bridge()
         return bridge, Home(await bridge.get_resources())
+
+    async def tell_watcher(target: Light | Group) -> list[str]:
+        """Before changing lights a pomodoro is showing a look on, say so to its watcher, so it
+        neither undoes the change nor takes it for one made at the switch or in the Hue app."""
+        lights = [target] if isinstance(target, Light) else target.lights
+        light_ids = [light.id for light in lights]
+        try:
+            touched = await ask("touched", lights=light_ids, timeout_s=TOUCHED_TIMEOUT_S)
+        except WatcherNotRunning:  # So no pomodoro either.
+            return []
+        except HueError as error:
+            return [f"Couldn't tell the pomodoro watcher ({error}); a pomodoro may undo this."]
+        if "room" not in touched:
+            return []
+        return [
+            f"A pomodoro is running in {touched['room']}; this change lasts until its next "
+            f"switch or nudge, unless save_pomodoro_look keeps it in its {touched['look']} look."
+        ]
 
     @server.tool(annotations=READ_ONLY)
     async def get_home(
@@ -207,11 +228,11 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
             applied["transition_seconds"] = transition_seconds
             body["dynamics"] = {"duration": round(transition_seconds * 1000)}
 
+        notes += await tell_watcher(target_item)
         if isinstance(target_item, Light):
             warnings = await bridge.update("light", target_item.id, body)
         else:
             warnings = await bridge.update("grouped_light", target_item.grouped_light["id"], body)
-        warnings += await _pomodoro_reminder(bridge, home, target_item)
         return _with_warnings({"target": target_item.label, "applied": applied}, notes + warnings)
 
     @server.tool()
@@ -249,11 +270,11 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         body: dict[str, Any] = {"on": {"on": True}, "dimming": {"brightness": brightness}}
         if transition_seconds is not None:
             body["dynamics"] = {"duration": round(transition_seconds * 1000)}
+        notes += await tell_watcher(target_item)
         if isinstance(target_item, Light):
             warnings = await bridge.update("light", target_item.id, body)
         else:
             warnings = await bridge.update("grouped_light", target_item.grouped_light["id"], body)
-        warnings += await _pomodoro_reminder(bridge, home, target_item)
         estimated = sum(power.watts_at(light, brightness) for light in lights)
         result = {
             "target": target_item.label,
@@ -279,8 +300,11 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         recall: dict[str, Any] = {"action": "dynamic_palette" if dynamic else "active"}
         if transition_seconds is not None:
             recall["duration"] = round(transition_seconds * 1000)
+        notes = await tell_watcher(found.group)
         warnings = await bridge.update("scene", found.id, {"recall": recall})
-        return _with_warnings({"activated": found.name, "room": found.group.name}, warnings)
+        return _with_warnings(
+            {"activated": found.name, "room": found.group.name}, notes + warnings
+        )
 
     @server.tool()
     async def create_scene(
@@ -296,7 +320,7 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         if any(s.group is group and s.name.casefold() == name.casefold() for s in home.scenes):
             raise HueError(f"{group.name} already has a scene named {name!r}.")
         actions = [
-            {"target": {"rid": light.id, "rtype": "light"}, "action": _current_look(light)}
+            {"target": {"rid": light.id, "rtype": "light"}, "action": current_look(light)}
             for light in group.lights
         ]
         await bridge.create(
@@ -348,7 +372,7 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
 
         applied: list[str] = []
         skipped: list[Light] = []
-        warnings: list[str] = []
+        warnings = await tell_watcher(target_item)
         for light in lights:
             body = _effect_body(light, effect, duration_ms, speed)
             if body is None:
@@ -401,9 +425,7 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         async with timer_lock:
             active = _our_timers(await bridge.get_schedules(), bridge.config.app_key)
             if len(active) >= MAX_ACTIVE_TIMERS:
-                in_pomodoro = sum(pomodoro.is_pomodoro(timer) for timer in active.values())
-                cause = f" ({in_pomodoro} by the pomodoro)" if in_pomodoro else ""
-                raise HueError(f"{len(active)} timers are already set{cause}; cancel one first.")
+                raise HueError(f"{len(active)} timers are already set; cancel one first.")
             timer_id = await bridge.create_schedule(
                 {
                     "name": TIMER_SCHEDULE_NAME,
@@ -426,7 +448,7 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
 
     @server.tool(annotations=READ_ONLY)
     async def list_timers() -> dict[str, Any]:
-        """Timers that haven't fired yet, including each switch of a running pomodoro."""
+        """Timers that haven't fired yet."""
         bridge = get_bridge()
         timers = _our_timers(await bridge.get_schedules(), bridge.config.app_key)
         return {"timers": [_describe_timer(timer_id, timer) for timer_id, timer in timers.items()]}
@@ -438,305 +460,64 @@ def build_server(get_bridge: Callable[[], HueBridge]) -> MCPServer:
         timer = _our_timers(await bridge.get_schedules(), bridge.config.app_key).get(timer_id)
         if timer is None:
             raise HueError(f"No timer with id {timer_id!r}; list_timers shows the active ones.")
-        if pomodoro.is_pomodoro(timer):
-            raise HueError("That timer is one switch of the pomodoro; stop_pomodoro ends it all.")
         await bridge.delete_schedule(timer_id)
         return {"cancelled": timer.get("description", timer_id)}
 
     @server.tool()
     async def start_pomodoro(
         room: Annotated[str, Field(description="The room or zone whose lights keep the time.")],
+        task_light: Annotated[
+            str | None,
+            Field(
+                description="The light the user reads or works by: it gets a white in the "
+                "focus looks."
+            ),
+        ] = None,
         focus_minutes: Annotated[int, Field(ge=1, le=120)] = 25,
-        break_minutes: Annotated[int, Field(ge=1, le=60)] = 5,
-        cycles: Annotated[
-            int, Field(ge=1, le=4, description="Focus periods, each followed by a break.")
+        short_break_minutes: Annotated[int, Field(ge=1, le=60)] = 5,
+        long_break_minutes: Annotated[int, Field(ge=1, le=120)] = 30,
+        rounds: Annotated[
+            int, Field(ge=1, le=8, description="Focus rounds before the long break.")
         ] = 4,
     ) -> dict[str, Any]:
-        """Start a pomodoro: the room keeps its current look for focus, and each break turns
-        its lights soft green (lights without color just dim).
+        """Start an adaptive pomodoro, run by the pomodoro watcher on the user's computer.
 
-        The bridge switches the lights, so it keeps going after this conversation ends. A new
-        pomodoro replaces one that is running; stop_pomodoro ends it early.
+        Focus looks follow the time of day; breaks are green, the long break violet. When a
+        break ends with the user away from the computer, the room waits, pulsing red, and the
+        next round starts when they're back. A new pomodoro replaces one that is running.
         """
-        bridge = get_bridge()
-        key = bridge.config.app_key
-        notes: list[str] = []
-        async with timer_lock:  # Also keeps two starts from each creating a focus scene.
-            home, group, settled = await _settled_room(bridge, lambda h: h.find_group(room))
-            if not any(light.reachable and light.resource["on"]["on"] for light in group.lights):
-                raise HueError(
-                    f"The lights in {group.label} are off. Set the look to focus with, then start."
-                )
-            phases = pomodoro.plan(focus_minutes, break_minutes, cycles, group.name)
-            ours = _our_timers(await bridge.get_schedules(), key)
-            running = {i: timer for i, timer in ours.items() if pomodoro.is_pomodoro(timer)}
-            others = len(ours) - len(running)
-            if others + len(phases) > MAX_ACTIVE_TIMERS:
-                raise HueError(
-                    f"{cycles} rounds need {len(phases)} timers, but {others} other timers are "
-                    "set; cancel some or use fewer rounds."
-                )
-            old_group = _pomodoro_group(home, running, key) if running else None
-            old_on_a_break = bool(running) and _break_ends(running) is not None
-            saved = _focus_scene(home, group)
-            if _shows_break_look(group) or (old_group is group and old_on_a_break):
-                # Mid-break, the lights show green: the focus look is the one saved before.
-                if saved is None:
-                    raise HueError(
-                        f"{group.label} shows the break look. Set the look to focus with, "
-                        "then start."
-                    )
-                focus_scene = _scene_v1_id(saved)
-                notes += await bridge.update("scene", saved.id, {"recall": {"action": "active"}})
-                notes.append("Brought back the focus look from before the break.")
-            else:
-                focus_scene = await _save_focus_look(bridge, home, group)
-                if not settled:
-                    notes.append("The lights were still changing; saved them mid-fade.")
-            started = datetime.now(UTC)
-            await _create_pomodoro_timers(bridge, group, phases, focus_scene)
-            # Only now that the new pomodoro is in place does the one it replaces go.
-            leftovers = await _delete_timers(bridge, running)
-            if old_group is not None and old_group is not group and old_on_a_break:
-                notes += await _recall_focus(bridge, home, old_group)
-        if not any(light.supports_color for light in group.lights):
-            notes.append(f"The lights in {group.name} can't show color; breaks dim them instead.")
-        if leftovers:
-            notes.append(f"Couldn't cancel the old pomodoro's timers {', '.join(leftovers)}.")
-        result: dict[str, Any] = {
-            "room": group.name,
-            "schedule": [
-                {
-                    "at": (started + phase.after).astimezone().isoformat(timespec="minutes"),
-                    "then": phase.description.removeprefix(pomodoro.DESCRIPTION_PREFIX).strip(),
-                }
-                for phase in phases
-            ],
-        }
-        if running:
-            result["replaced"] = "the pomodoro that was running"
-        return _with_warnings(result, notes)
-
-    @server.tool()
-    async def save_pomodoro_look() -> dict[str, Any]:
-        """Keep the room's current look as the running pomodoro's focus look.
-
-        Call it after changing the lights during focus time, so the next focus period keeps
-        the change instead of going back to the look the pomodoro started with.
-        """
-        bridge = get_bridge()
-        key = bridge.config.app_key
-        async with timer_lock:
-            running = await _running_pomodoro(bridge)
-            if (break_ends := _break_ends(running)) is not None:
-                raise HueError(
-                    f"It's break time until {break_ends}; change the focus look after that."
-                )
-            home, group, settled = await _settled_room(
-                bridge, lambda h: _existing(_pomodoro_group(h, running, key))
-            )
-            await _save_focus_look(bridge, home, group)
-        result = {"saved": f"the current look of {group.name} as its focus look"}
-        if not settled:
-            return _with_warnings(result, ["The lights were still changing; saved mid-fade."])
+        result = await ask(
+            "start",
+            room=room,
+            task_light=task_light,
+            focus_minutes=focus_minutes,
+            short_break_minutes=short_break_minutes,
+            long_break_minutes=long_break_minutes,
+            rounds=rounds,
+        )
         return result
 
     @server.tool()
+    async def save_pomodoro_look() -> dict[str, Any]:
+        """Keep the room's current look as the pomodoro look it is showing (this part of the
+        day's focus look, or a break look), so it comes back that way from now on."""
+        return await ask("save_look")
+
+    @server.tool()
     async def stop_pomodoro() -> dict[str, Any]:
-        """Stop the running pomodoro and bring its focus look back."""
-        bridge = get_bridge()
-        async with timer_lock:
-            running = await _running_pomodoro(bridge)
-            leftovers = await _delete_timers(bridge, running)
-        home = Home(await bridge.get_resources())
-        group = _pomodoro_group(home, running, bridge.config.app_key)
-        notes = await _recall_focus(bridge, home, group) if group else []
-        if leftovers:
-            notes.append(f"Couldn't cancel timers {', '.join(leftovers)}; try again.")
-        stopped = f"the pomodoro in {group.name}" if group else "the pomodoro"
-        return _with_warnings({"stopped": stopped}, notes)
+        """Stop the running pomodoro and bring back the focus look for this time of day."""
+        return await ask("stop")
+
+    @server.tool(annotations=READ_ONLY)
+    async def get_pomodoro(
+        days: Annotated[
+            int, Field(ge=1, le=366, description="Days of completed rounds to count.")
+        ] = 7,
+    ) -> dict[str, Any]:
+        """The running pomodoro's phase, and the focus rounds completed each day."""
+        return await ask("status", days=days)
 
     return server
-
-
-async def _settled_room(
-    bridge: HueBridge, pick: Callable[[Home], Group]
-) -> tuple[Home, Group, bool]:
-    """The room once its lights hold still (mid-fade, the bridge reports passing values), and
-    whether they did within SETTLE_TRIES reads."""
-    home = Home(await bridge.get_resources())
-    group = pick(home)
-    for _ in range(SETTLE_TRIES):
-        await anyio.sleep(SETTLE_INTERVAL_S)
-        again = Home(await bridge.get_resources())
-        regrouped = pick(again)
-        if _looks(regrouped) == _looks(group):
-            return again, regrouped, True
-        home, group = again, regrouped
-    return home, group, False
-
-
-def _looks(group: Group) -> list[Any]:
-    return [
-        (
-            light.id,
-            light.resource.get("on"),
-            light.resource.get("dimming"),
-            light.resource.get("color_temperature"),
-            light.resource.get("color"),
-        )
-        for light in group.lights
-    ]
-
-
-def _shows_break_look(group: Group) -> bool:
-    """Whether the room's color lights show the pomodoro's green break look."""
-    x, y = pomodoro.break_look()["xy"]
-    lit = [light.resource for light in group.lights if light.supports_color and light.reachable]
-    lit = [resource for resource in lit if resource["on"]["on"]]
-    return bool(lit) and all(
-        abs(resource.get("dimming", {}).get("brightness", 0) - pomodoro.BREAK_BRIGHTNESS) < 2
-        and abs(resource["color"].get("xy", {}).get("x", 0) - x) < 0.01
-        and abs(resource["color"].get("xy", {}).get("y", 0) - y) < 0.01
-        for resource in lit
-    )
-
-
-def _focus_scene(home: Home, group: Group) -> Scene | None:
-    return next(
-        (s for s in home.scenes if s.group is group and s.name == pomodoro.FOCUS_SCENE), None
-    )
-
-
-def _scene_v1_id(scene: Scene) -> str:
-    return _v1_path(scene.resource).removeprefix("/scenes/")
-
-
-async def _save_focus_look(bridge: HueBridge, home: Home, group: Group) -> str:
-    """Save the group's look as its focus scene, and return the scene's v1 id for timers."""
-    actions = [
-        {"target": {"rid": light.id, "rtype": "light"}, "action": _current_look(light)}
-        for light in group.lights
-    ]
-    saved = _focus_scene(home, group)
-    if saved is None:
-        scene_id = await bridge.create(
-            "scene",
-            {
-                "type": "scene",
-                "metadata": {"name": pomodoro.FOCUS_SCENE},
-                "group": {"rid": group.id, "rtype": group.kind},
-                "actions": actions,
-            },
-        )
-    else:
-        scene_id = saved.id
-        await bridge.update("scene", scene_id, {"actions": actions})
-    scene = next((s for s in Home(await bridge.get_resources()).scenes if s.id == scene_id), None)
-    if scene is None:
-        raise HueError("The bridge didn't list the focus scene it just saved; try again.")
-    return _scene_v1_id(scene)
-
-
-async def _create_pomodoro_timers(
-    bridge: HueBridge, group: Group, phases: list[pomodoro.Phase], focus_scene: str
-) -> None:
-    address = f"/api/{bridge.config.app_key}{_v1_path(group.grouped_light)}/action"
-    created: list[str] = []
-    try:
-        for phase in phases:
-            look = pomodoro.break_look() if phase.is_break else {"scene": focus_scene}
-            created.append(
-                await bridge.create_schedule(
-                    {
-                        "name": TIMER_SCHEDULE_NAME,
-                        "description": phase.description[:64],
-                        "command": {"address": address, "method": "PUT", "body": look},
-                        "localtime": f"PT{_hours_minutes_seconds(phase.after)}",
-                        "autodelete": True,
-                    }
-                )
-            )
-    except HueError as error:  # Half a pomodoro would be worse than none.
-        leftovers = await _delete_timers(bridge, created)
-        if leftovers:
-            remain = ", ".join(leftovers)
-            message = f"{error} Timers {remain} remain; stop_pomodoro removes them."
-            raise HueError(message) from error
-        raise
-
-
-async def _delete_timers(bridge: HueBridge, timer_ids: Iterable[str]) -> list[str]:
-    """Delete each timer, carrying on past failures; returns the ones that remain."""
-    leftovers = []
-    for timer_id in timer_ids:
-        try:
-            await bridge.delete_schedule(timer_id)
-        except HueError:
-            leftovers.append(timer_id)
-    return leftovers
-
-
-async def _recall_focus(bridge: HueBridge, home: Home, group: Group) -> list[str]:
-    focus = _focus_scene(home, group)
-    if focus is None:
-        return []
-    return await bridge.update("scene", focus.id, {"recall": {"action": "active"}})
-
-
-async def _running_pomodoro(bridge: HueBridge) -> dict[str, dict[str, Any]]:
-    running = _pomodoro_timers(await bridge.get_schedules(), bridge.config.app_key)
-    if not running:
-        raise HueError("No pomodoro is running.")
-    return running
-
-
-def _pomodoro_timers(
-    schedules: dict[str, dict[str, Any]], app_key: str
-) -> dict[str, dict[str, Any]]:
-    ours = _our_timers(schedules, app_key)
-    return {timer_id: timer for timer_id, timer in ours.items() if pomodoro.is_pomodoro(timer)}
-
-
-def _break_ends(running: dict[str, dict[str, Any]]) -> str | None:
-    """When the current break ends (HH:MM), or None during focus. The next switch tells which:
-    a switch back to focus recalls the focus scene."""
-    described = sorted(
-        ((_describe_timer(timer_id, timer), timer) for timer_id, timer in running.items()),
-        key=lambda pair: pair[0].get("minutes_left", math.inf),
-    )
-    upcoming, timer = described[0]
-    if "scene" not in timer.get("command", {}).get("body", {}):
-        return None
-    if "fires_at" not in upcoming:
-        return "the next switch"
-    return datetime.fromisoformat(upcoming["fires_at"]).strftime("%H:%M")
-
-
-def _pomodoro_group(home: Home, running: dict[str, dict[str, Any]], app_key: str) -> Group | None:
-    """The room or zone the pomodoro's timers switch, read from their command address."""
-    address = next(iter(running.values())).get("command", {}).get("address", "")
-    group_path = address.removeprefix(f"/api/{app_key}").removesuffix("/action")
-    return next((g for g in home.groups if g.grouped_light.get("id_v1") == group_path), None)
-
-
-def _existing(group: Group | None) -> Group:
-    if group is None:
-        raise HueError("The room this pomodoro runs in no longer exists.")
-    return group
-
-
-async def _pomodoro_reminder(bridge: HueBridge, home: Home, target: Light | Group) -> list[str]:
-    """During a pomodoro's focus time, a change to its room is lost at the next break unless
-    saved; this says so."""
-    running = _pomodoro_timers(await bridge.get_schedules(), bridge.config.app_key)
-    group = _pomodoro_group(home, running, bridge.config.app_key) if running else None
-    if group is None or _break_ends(running) is not None:
-        return []
-    changed = {target.id} if isinstance(target, Light) else {light.id for light in target.lights}
-    if not changed & {light.id for light in group.lights}:
-        return []
-    return [f"A pomodoro is running in {group.name}; save_pomodoro_look keeps this for focus."]
 
 
 def _with_warnings(result: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
@@ -842,23 +623,6 @@ def _active_effect(light: Light) -> str | None:
         resource.get("timed_effects", {}).get("status"),
     ]
     return next((s for s in statuses if s and s != NO_EFFECT), None)
-
-
-def _current_look(light: Light) -> dict[str, Any]:
-    resource = light.resource
-    if not resource["on"]["on"]:
-        return {"on": {"on": False}}
-    look: dict[str, Any] = {"on": {"on": True}}
-    brightness = resource.get("dimming", {}).get("brightness")
-    if brightness is not None:
-        look["dimming"] = {"brightness": brightness}
-    color_temperature = resource.get("color_temperature") or {}
-    xy = resource.get("color", {}).get("xy")
-    if color_temperature.get("mirek_valid") and color_temperature.get("mirek"):
-        look["color_temperature"] = {"mirek": color_temperature["mirek"]}
-    elif xy:
-        look["color"] = {"xy": xy}
-    return look
 
 
 def _effect_body(
