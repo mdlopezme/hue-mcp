@@ -51,7 +51,7 @@ claude mcp add --scope user hue -- /absolute/path/to/hue-mcp/.venv/bin/hue-mcp
 | `set_effect` | candle, fire, prism and other looping effects; sunrise/sunset over up to 6 h; `none` stops them |
 | `set_timer` / `list_timers` / `cancel_timer` | "Turn the bedroom off in 30 minutes", run by the bridge |
 | `start_pomodoro` / `stop_pomodoro` / `get_pomodoro` / `save_pomodoro_look` | Adaptive focus rounds whose looks follow the sun; see [Pomodoro](#pomodoro) |
-| `start_light_show` / `stop_light_show` / `place_show_light` / `order_show_lights` | Lights following the music, the screen or the processor, 25 times a second; see [Light shows](#light-shows) |
+| `start_light_show` / `stop_light_show` / `place_show_light` / `order_show_lights` | Lights following the music, the screen, the processor or a race kart, 25 times a second; see [Light shows](#light-shows) |
 
 Good to know:
 
@@ -125,7 +125,7 @@ rounds log in `~/.local/state/hue-mcp/`; its log is `journalctl --user -u hue-mc
 
 `start_light_show` streams colors to an entertainment area (make one in the Hue app: Settings,
 Entertainment areas) through Hue's entertainment API, the one Hue Sync uses: every light
-changes together, about 25 times a second. Four modes:
+changes together, about 25 times a second. Five modes:
 
 - **music**: colors spread across the lights, swinging with the bass and punching on the beats
   of whatever the computer plays.
@@ -137,10 +137,11 @@ changes together, about 25 times a second. Four modes:
   from blue when idle through cyan, green, yellow and orange to red when busy, and the 5-minute
   one sets their brightness, so a burst shifts the color and only sustained work brightens the
   room. The kernel already smooths both, so the lights drift rather than jump.
+- **race**: a race kart's state, from its ROS 2 stack (see [The race show](#the-race-show)).
 
 `order_show_lights` sets the lights' order, around the room say: music colors spread along it. The watcher plays the show, so it outlasts the
 conversation; a running pomodoro pauses for it and carries on after. Music and screen shows end
-after 15 minutes without you at the computer; the cpu show, a monitor, stays on. Either way,
+after 15 minutes without you at the computer; the cpu and race shows, monitors, stay on. Either way,
 the lights go back to how they were before the show. Flashes never come faster than three a
 second, whatever the screen or the music does.
 
@@ -150,6 +151,44 @@ screen modes the system Python's PyGObject and GStreamer PipeWire plugin (Debian
 the screen; on a multi-monitor desktop, share the full workspace and the watcher cuts it into
 monitors. Only loudness and bass leave the sound, and a 64x20-pixel thumbnail the screen;
 neither is kept.
+
+### The race show
+
+The race show is for a pit wall: the room shows how a race kart is doing, from the ROS 2 topics
+its stack publishes. A breathing light means a problem with the kart, and beats any flag:
+
+| Breathing | When |
+|---|---|
+| Blue | No fault status for 2 s: the link is down, or the stack isn't running |
+| Amber / orange / red | The fault multiplexer asks for a safe / immediate / emergency stop |
+
+Otherwise a steady light shows the race-control flag. When several are up, the first in this
+list wins:
+
+| Steady | Flags |
+|---|---|
+| Red | E-kill, stop, red |
+| Dim white | Black |
+| Purple | Purple |
+| Orange | Orange |
+| Yellow | Double yellow, yellow, full course yellow |
+| Blue | Blue |
+| White | Checkered |
+| Green | Green, waved green, the speed-limited greens |
+| Dim warm white | No flag, or none for 5 s |
+
+It reads `/faults/status` (`race_msgs/FaultMultiplexerStatus`) and `/rc_to_ct`
+(`race_msgs/VehicleCommand`) through a helper that runs in the stack's workspace, on the
+Python ROS uses. Tell it where the workspace is once, from a shell set up for the stack: the
+setup script doesn't set the middleware, so `set-ros` also saves this shell's
+`RMW_IMPLEMENTATION`, `CYCLONEDDS_URI`, `ROS_DOMAIN_ID`, `ROS_AUTOMATIC_DISCOVERY_RANGE` and
+`ROS_STATIC_PEERS` to `~/.config/hue-mcp/ros.json`:
+
+```sh
+.venv/bin/hue-mcp set-ros ~/ws/install/setup.bash
+```
+
+Run it again after changing any of those settings.
 
 ## Development
 

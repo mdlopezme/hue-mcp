@@ -5,16 +5,20 @@ import pytest
 
 from hue_mcp.config import (
     Location,
+    RosConfig,
     config_path,
     load_config,
     load_location,
     load_placements,
+    load_ros,
     load_show_order,
     location_path,
     placements_path,
+    ros_path,
     save_config,
     save_location,
     save_placements,
+    save_ros,
     save_show_order,
     show_order_path,
 )
@@ -143,6 +147,35 @@ def test_an_unusable_location_says_how_to_fix_it(content):
     location_path().write_text(content)
     with pytest.raises(HueError, match="set-location"):
         load_location()
+
+
+def test_no_ros_workspace_until_one_is_set():
+    assert load_ros() is None
+
+
+def test_the_ros_workspace_round_trips_privately():
+    ros = RosConfig("/ws/install/setup.bash", {"RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp"})
+    save_ros(ros)
+    assert load_ros() == ros
+    assert mode(ros_path()) == 0o600
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        '{"setup": "/ws/install/setup.bash"}',
+        '{"setup": "", "environment": {}}',
+        '{"setup": 7, "environment": {}}',
+        '{"setup": "/ws/install/setup.bash", "environment": ["ROS_DOMAIN_ID"]}',
+        '{"setup": "/ws/install/setup.bash", "environment": {"ROS_DOMAIN_ID": 42}}',
+    ],
+)
+def test_an_unusable_ros_workspace_says_how_to_fix_it(content):
+    ros_path().parent.mkdir(parents=True)
+    ros_path().write_text(content)
+    with pytest.raises(HueError, match="set-ros"):
+        load_ros()
 
 
 def test_older_pairings_have_no_client_key_and_still_load():

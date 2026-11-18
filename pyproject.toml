@@ -56,6 +56,11 @@ strict = true
 module = ["gi", "gi.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# The race helper runs in a ROS 2 workspace's environment, whose packages aren't in the venv.
+module = ["rclpy", "rclpy.*", "race_msgs", "race_msgs.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-markers"]
@@ -64,9 +69,10 @@ filterwarnings = ["error"]
 [tool.coverage.run]
 source = ["hue_mcp"]
 branch = true
-# Runs on the system Python, with the desktop's screen sharing; checked by hand and by the
-# test that keeps its constants in step with hue_mcp.screen.
-omit = ["*/hue_mcp/screen_capture.py"]
+# The helpers run outside the venv: screen capture on the system Python, with the desktop's
+# screen sharing, and the race listener in a ROS 2 workspace. Checked by hand, and by the tests
+# that keep their constants in step with hue_mcp.screen and hue_mcp.race.
+omit = ["*/hue_mcp/screen_capture.py", "*/hue_mcp/race_listener.py"]
 
 [tool.coverage.report]
 show_missing = true

@@ -12,11 +12,20 @@ from pathlib import Path
 import anyio
 
 from hue_mcp.bridge import HueBridge
-from hue_mcp.config import BridgeConfig, Location, config_dir, load_config, save_location
+from hue_mcp.config import (
+    BridgeConfig,
+    Location,
+    RosConfig,
+    config_dir,
+    load_config,
+    save_location,
+    save_ros,
+)
 from hue_mcp.discovery import is_ipv4
 from hue_mcp.errors import HueError
 from hue_mcp.pairing import run_setup
 from hue_mcp.places import find_places
+from hue_mcp.race import ROS_MIDDLEWARE
 from hue_mcp.server import build_server
 from hue_mcp.session import IDLE_TIMEOUT_S
 from hue_mcp.show import MODES
@@ -24,7 +33,11 @@ from hue_mcp.watcher import SHOW_REPLY_TIMEOUT_S, Watcher, ask_watcher
 from hue_mcp.wayland_idle import WaylandError, idle_changes
 
 SERVICE_NAME = "hue-mcp-watch.service"
-FAILURES = {"setup": "Setup failed", "set-location": "Couldn't set the location"}
+FAILURES = {
+    "setup": "Setup failed",
+    "set-location": "Couldn't set the location",
+    "set-ros": "Couldn't set the ROS 2 workspace",
+}
 
 
 def main() -> None:
@@ -41,6 +54,14 @@ def main() -> None:
         "set-location", help="where the lights are, for the pomodoro's sun times"
     )
     set_location.add_argument("city", help='a city name, like "Lisbon"')
+    set_ros = commands.add_parser(
+        "set-ros",
+        help="the ROS 2 workspace the race light show reads, with this shell's middleware "
+        "settings",
+    )
+    set_ros.add_argument(
+        "setup", type=Path, help="the workspace's setup script, like ~/ws/install/setup.bash"
+    )
     watch = commands.add_parser("watch", help="run the pomodoro watcher (a background service)")
     watch.add_argument(
         "--print-activity",
@@ -62,6 +83,8 @@ def main() -> None:
             print(f"  claude mcp add --scope user hue -- {shlex.quote(str(_executable()))}")
         elif args.command == "set-location":
             _set_location(args.city)
+        elif args.command == "set-ros":
+            _set_ros(args.setup)
         elif args.command == "watch" and args.print_activity:
             anyio.run(_print_activity)
         elif args.command == "watch":
@@ -130,6 +153,20 @@ def _set_location(city: str) -> None:
     save_location(place)
     print(f"Saved {place.label} ({place.latitude:.2f}, {place.longitude:.2f}).")
     print("The pomodoro's looks now follow the sun there.")
+
+
+def _set_ros(setup: Path) -> None:
+    if not setup.is_file():
+        raise HueError(f"{setup} isn't a file; give the workspace's install/setup.bash.")
+    environment = {name: os.environ[name] for name in ROS_MIDDLEWARE if name in os.environ}
+    ros = RosConfig(str(setup.resolve()), environment)
+    save_ros(ros)
+    print(f"Saved {ros.setup}, with this shell's middleware settings:")
+    for name, value in environment.items():
+        print(f"  {name}={value}")
+    if not environment:
+        print("  none: ROS 2's defaults.")
+    print("The race light show sources it and uses these settings.")
 
 
 def _choose(places: list[Location]) -> Location:

@@ -1328,11 +1328,12 @@ async def test_an_order_is_checked(harness, lights, error):
         await harness.watcher.handle({"command": "show_order", "lights": lights})
 
 
-async def test_a_cpu_show_stays_on_while_nobody_is_there(harness, fake_show):
+@pytest.mark.parametrize("mode", ["cpu", "race"])
+async def test_a_monitor_show_stays_on_while_nobody_is_there(harness, fake_show, mode):
     w = harness.watcher
     async with anyio.create_task_group() as tg:
         w._task_group = tg
-        await w.handle({"command": "show_start", "mode": "cpu"})
+        await w.handle({"command": "show_start", "mode": mode})
         assert w._show is not None
         w.tracker.idled(harness.clock.now)
         harness.advance(watcher_module.SHOW_AWAY_LIMIT_S * 4)

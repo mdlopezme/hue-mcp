@@ -39,6 +39,27 @@ class Location:
             raise HueError(f"{self.label!r} has no valid coordinates.")
 
 
+@dataclass(frozen=True)
+class RosConfig:
+    """How the race light show reaches a ROS 2 stack: the workspace's setup script, and the
+    middleware settings of the shell it was saved from."""
+
+    setup: str
+    environment: dict[str, str]
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.setup, str)
+            and self.setup
+            and isinstance(self.environment, dict)
+            and all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in self.environment.items()
+            )
+        ):
+            raise HueError("it has no setup script, or settings that aren't text.")
+
+
 def config_dir() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(config_home) / "hue-mcp"
@@ -91,6 +112,25 @@ def load_location() -> Location | None:
 
 def save_location(location: Location) -> None:
     atomic_write_json(location_path(), asdict(location))
+
+
+def ros_path() -> Path:
+    return config_dir() / "ros.json"
+
+
+def load_ros() -> RosConfig | None:
+    path = ros_path()
+    hint = "run `hue-mcp set-ros <workspace>/install/setup.bash` again"
+    try:
+        return RosConfig(**json.loads(path.read_text()))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, HueError) as error:
+        raise HueError(f"{path} is unusable ({error}); {hint}.") from error
+
+
+def save_ros(ros: RosConfig) -> None:
+    atomic_write_json(ros_path(), asdict(ros))
 
 
 def placements_path() -> Path:

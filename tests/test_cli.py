@@ -6,8 +6,9 @@ import pytest
 from mcp import Client, StdioServerParameters
 
 from hue_mcp import cli
-from hue_mcp.config import Location, load_location, save_config
+from hue_mcp.config import Location, RosConfig, load_location, load_ros, save_config
 from hue_mcp.errors import HueError
+from hue_mcp.race import ROS_MIDDLEWARE
 from hue_mcp.wayland_idle import WaylandError
 
 from conftest import CONFIG
@@ -154,6 +155,41 @@ def test_set_location_with_no_match_says_so(monkeypatch):
     with pytest.raises(SystemExit, match="Couldn't set the location: No place called 'Xyzzy'"):
         cli.main()
     assert load_location() is None
+
+
+def test_set_ros_saves_the_setup_script_and_this_shells_middleware(monkeypatch, capsys, tmp_path):
+    setup = tmp_path / "ws" / "install" / "setup.bash"
+    setup.parent.mkdir(parents=True)
+    setup.touch()
+    for name in ROS_MIDDLEWARE:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+    monkeypatch.setenv("ROS_DOMAIN_ID", "7")
+    monkeypatch.setenv("ROS_DISTRO", "lyrical")  # Not a middleware setting.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["hue-mcp", "set-ros", "ws/install/setup.bash"])
+    cli.main()
+    environment = {"RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp", "ROS_DOMAIN_ID": "7"}
+    assert load_ros() == RosConfig(str(setup), environment)
+    assert "  ROS_DOMAIN_ID=7" in capsys.readouterr().out
+
+
+def test_set_ros_in_a_plain_shell_keeps_ros_defaults(monkeypatch, capsys, tmp_path):
+    setup = tmp_path / "setup.bash"
+    setup.touch()
+    for name in ROS_MIDDLEWARE:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(sys, "argv", ["hue-mcp", "set-ros", str(setup)])
+    cli.main()
+    assert load_ros() == RosConfig(str(setup), {})
+    assert "none: ROS 2's defaults" in capsys.readouterr().out
+
+
+def test_set_ros_needs_a_setup_script(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["hue-mcp", "set-ros", str(tmp_path / "missing.bash")])
+    with pytest.raises(SystemExit, match=r"Couldn't set the ROS 2 workspace: .* isn't a file"):
+        cli.main()
+    assert load_ros() is None
 
 
 def test_closing_the_question_exits_quietly(monkeypatch):

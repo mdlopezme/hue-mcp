@@ -48,7 +48,7 @@ from hue_mcp.session import (
     Session,
     is_positive_number,
 )
-from hue_mcp.show import MODES, Mode, Placement, run_show
+from hue_mcp.show import MODES, MONITORS, Mode, Placement, run_show
 from hue_mcp.wayland_idle import WaylandError, idle_changes
 
 logger = logging.getLogger(__name__)
@@ -621,7 +621,7 @@ class Watcher:
     def _show_should_end(self, run: _ShowRun) -> str | None:
         if run.end_reason is not None:
             return run.end_reason
-        if run.mode == "cpu":  # A monitor, meant to stay on while nobody's there.
+        if run.mode in MONITORS:
             return None
         now = self._clock()
         activity = self.tracker.at(now)

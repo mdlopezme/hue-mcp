@@ -37,8 +37,8 @@ since Hue bulbs don't report what they draw; say so when quoting them.
 For focus sessions use start_pomodoro, and get_pomodoro for its progress. When a result says a
 pomodoro is running in the room you changed, the change lasts until the pomodoro's next switch
 or nudge; if the user wants to keep it, call save_pomodoro_look.
-For a light show (lights following the music, the screen, both, or how busy the computer's
-processor is) use start_light_show; to
+For a light show (lights following the music, the screen, both, how busy the computer's
+processor is, or a race kart's health and race-control flag) use start_light_show; to
 pick which part of the screen a light follows, place_show_light (flash the light with set_lights
 first if the user needs to tell which one it is)."""
 
@@ -50,7 +50,7 @@ LIGHT_COMMAND_SPACING_S = 0.1  # The bridge handles about 10 light commands per 
 TOUCHED_TIMEOUT_S = 3.0  # Telling the pomodoro watcher must not hold up a light change.
 
 TargetType = Literal["light", "room", "zone"]
-ShowMode = Literal["music", "screen", "both", "cpu"]
+ShowMode = Literal["music", "screen", "both", "cpu", "race"]
 Effect = Literal[
     "candle",
     "fire",
@@ -539,7 +539,13 @@ def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watc
                 description="music: colors and flashes from what the computer plays; screen: "
                 "each light mirrors its part of the screen; both: screen colors, music "
                 "brightness; cpu: how loaded the computer is, colored by its 1-minute load "
-                "average (blue idle to red busy) and as bright as its 5-minute one."
+                "average (blue idle to red busy) and as bright as its 5-minute one; race: a "
+                "race kart's state from its ROS 2 stack. Breathing means a problem, and beats "
+                "any flag: blue, no data from the kart; amber, orange or red, the stop it asks "
+                "for (safe, immediate, emergency). Otherwise the race-control flag holds "
+                "steady: red (also stop, e-kill), dim white (black), purple, orange, yellow "
+                "(also double yellow, full course yellow), blue, white (checkered), green (also "
+                "speed-limited greens); a dim warm white is no flag."
             ),
         ],
         room: Annotated[
@@ -548,10 +554,11 @@ def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watc
     ) -> dict[str, Any]:
         """Stream a light show, about 25 updates a second through Hue's entertainment API.
 
-        The watcher runs it until stop_light_show, or (except cpu, a monitor) 15 minutes
-        without the user at the computer; then the lights go back to how they were. A
+        The watcher runs it until stop_light_show, or (except cpu and race, monitors) 15
+        minutes without the user at the computer; then the lights go back to how they were. A
         running pomodoro pauses for it.
-        The first screen show makes the desktop ask the user to share the screen.
+        The first screen show makes the desktop ask the user to share the screen. The race
+        show needs `hue-mcp set-ros` run once in a shell set up for the kart's stack.
         """
         return await ask("show_start", mode=mode, room=room, timeout_s=SHOW_REPLY_TIMEOUT_S)
 

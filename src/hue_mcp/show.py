@@ -1,4 +1,5 @@
-"""Light shows: colors for each light, 50 times a second, from the music, the screen or both."""
+"""Light shows: colors for each light, 50 times a second, from the music, the screen, both, the
+processor's load or a race kart's state."""
 
 import colorsys
 import math
@@ -16,16 +17,20 @@ from hue_mcp.cpu import CpuMeter
 from hue_mcp.entertainment import Area, Stream
 from hue_mcp.errors import HueError
 from hue_mcp.huestream import RGB
+from hue_mcp.race import Look, Race
 from hue_mcp.screen import Region, Screen
 
-Mode = Literal["music", "screen", "both", "cpu"]
-MODES: tuple[Mode, ...] = ("music", "screen", "both", "cpu")
+Mode = Literal["music", "screen", "both", "cpu", "race"]
+MODES: tuple[Mode, ...] = ("music", "screen", "both", "cpu", "race")
+MONITORS: tuple[Mode, ...] = ("cpu", "race")  # Meant to stay on while nobody's there.
 
 FRAME_S = 0.02  # The bridge renders 25 frames a second; sending twice that covers lost ones.
 CHECK_EVERY_S = 5.0  # How often to ask the bridge whether the stream is still ours.
 SHARE_TIMEOUT_S = 150.0  # For the user to answer the desktop's screen-sharing question.
 SMOOTHING_S = 0.15  # Screen colors are followed this smoothly, so cuts don't flicker.
 CPU_SMOOTHING_S = 0.6  # Core loads, sampled twice a second, glide rather than jump.
+RACE_SMOOTHING_S = 0.3  # A new flag shows within a second, without a hard cut.
+RACE_START_TIMEOUT_S = 30.0  # For the race helper to load ROS and subscribe.
 # A thermal scale, as on weather maps: blue for an idle machine, through cyan, green, yellow
 # and orange, to red for a flat-out one.
 LOAD_SCALE: tuple[tuple[float, RGB], ...] = (
@@ -75,9 +80,11 @@ class Renderer:
         sound: Sound,
         screens: dict[int, dict[Region, RGB]],
         pressure: tuple[float, float] | None = None,
+        race: Look | None = None,
     ) -> dict[str, RGB]:
         """`pressure`, the machine's 1- and 5-minute load averages per core (0 to 1), drives
-        the cpu mode: the quicker one colors the lights, the slower one sets how bright."""
+        the cpu mode: the quicker one colors the lights, the slower one sets how bright.
+        `race`, the look of the kart's state, drives the race mode."""
         dt = 0.0 if self._last is None else max(0.0, now - self._last)
         self._last = now
         self._follow_music(dt, sound)
@@ -88,6 +95,9 @@ class Renderer:
             elif self.mode == "cpu":
                 target = _load_color(*(pressure or (0.0, 0.0)))
                 color = self._smooth(light, target, dt, CPU_SMOOTHING_S)
+            elif self.mode == "race":
+                target = race.at(now) if race is not None else (0.0, 0.0, 0.0)
+                color = self._smooth(light, target, dt, RACE_SMOOTHING_S)
             else:
                 color = self._smooth(light, _screen_color(screens, placement), dt)
                 if self.mode == "both" and sound is not SILENCE:
@@ -204,6 +214,7 @@ async def run_show(
     listener = Listener() if mode in ("music", "both") else None
     screen = Screen() if mode in ("screen", "both") else None
     meter = CpuMeter() if mode == "cpu" else None
+    race = Race() if mode == "race" else None
     lost: list[str] = []  # Set when the bridge takes the lights back.
     try:
         async with anyio.create_task_group() as sources:
@@ -211,6 +222,12 @@ async def run_show(
                 sources.start_soon(listener.run)
             if meter is not None:
                 sources.start_soon(meter.run)
+            if race is not None:
+                sources.start_soon(race.run)
+                with anyio.move_on_after(RACE_START_TIMEOUT_S):
+                    await race.ready.wait()
+                if not race.ready.is_set():
+                    raise HueError("The race helper didn't subscribe to the stack in time.")
             if screen is not None:
                 sources.start_soon(screen.run)
                 with anyio.move_on_after(SHARE_TIMEOUT_S):
@@ -220,7 +237,9 @@ async def run_show(
             async with Stream(bridge, area) as stream:
                 started()
                 sources.start_soon(_watch_ownership, stream, lost)
-                reason = await _play(stream, renderer, listener, screen, meter, should_end, lost)
+                reason = await _play(
+                    stream, renderer, listener, screen, meter, race, should_end, lost
+                )
             sources.cancel_scope.cancel()
     except* HueError as failures:
         raise failures.exceptions[0] from None
@@ -244,6 +263,7 @@ async def _play(
     listener: Listener | None,
     screen: Screen | None,
     meter: CpuMeter | None,
+    race: Race | None,
     should_end: Callable[[], str | None],
     lost: list[str],
 ) -> str:
@@ -259,6 +279,7 @@ async def _play(
             beats_seen = listener.beats
         screens = screen.colors if screen is not None else {}
         pressure = meter.pressure if meter is not None else None
-        stream.send(renderer.frame(now, sound, screens, pressure))
+        look = race.look(now) if race is not None else None
+        stream.send(renderer.frame(now, sound, screens, pressure, look))
         next_frame = max(next_frame + FRAME_S, anyio.current_time())
         await anyio.sleep_until(next_frame)

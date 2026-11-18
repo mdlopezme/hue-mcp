@@ -7,6 +7,7 @@ from hue_mcp import show
 from hue_mcp.audio import SILENCE, Sound
 from hue_mcp.entertainment import Area
 from hue_mcp.errors import HueError
+from hue_mcp.race import Look
 from hue_mcp.show import Placement, Renderer, run_show
 
 pytestmark = pytest.mark.anyio
@@ -246,6 +247,57 @@ async def test_a_cpu_show_reads_the_meter(monkeypatch):
     assert await run_show(None, AREA, "cpu", {}, should_end, lambda: None) == "enough"  # type: ignore[arg-type]
 
 
+def test_race_lights_glide_to_the_karts_look():
+    renderer = Renderer("race", {"a": Placement(), "b": Placement(max_brightness=0.3)})
+    green = Look((0.0, 1.0, 0.0), 0.8)
+    for step in range(100):
+        colors = renderer.frame(step * 0.02, SILENCE, {}, race=green)
+    assert colors["a"] == pytest.approx((0.0, 0.8, 0.0), abs=0.01)
+    assert colors["b"] == pytest.approx((0.0, 0.3, 0.0), abs=0.01)  # Its cap still holds.
+    assert Renderer("race", {"a": Placement()}).frame(0, SILENCE, {})["a"] == BLACK
+
+
+class FakeRace:
+    subscribes = True
+
+    def __init__(self) -> None:
+        self.ready = anyio.Event()
+
+    def look(self, now: float) -> Look:
+        return Look((1.0, 0.0, 0.0), 1.0)
+
+    async def run(self) -> None:
+        if FakeRace.subscribes:
+            self.ready.set()
+        await anyio.sleep_forever()
+
+
+async def test_a_race_show_follows_the_kart(monkeypatch):
+    monkeypatch.setattr(show, "Race", FakeRace)
+    FakeRace.subscribes = True
+    frames = 0
+
+    def should_end() -> str | None:
+        nonlocal frames
+        frames += 1
+        return "enough" if frames > 30 else None
+
+    assert await run_show(None, AREA, "race", {}, should_end, lambda: None) == "enough"  # type: ignore[arg-type]
+    [stream] = FakeStream.instances
+    red, green, blue = stream.sent[-1]["light-a"]
+    assert red > 0.2  # Rising from black, held back by the flash limiter.
+    assert green == blue == 0.0
+
+
+async def test_a_race_helper_that_never_subscribes_ends_the_start(monkeypatch):
+    monkeypatch.setattr(show, "Race", FakeRace)
+    monkeypatch.setattr(show, "RACE_START_TIMEOUT_S", 0.05)
+    FakeRace.subscribes = False
+    with pytest.raises(HueError, match="didn't subscribe"):
+        await run_show(None, AREA, "race", {}, lambda: None, lambda: None)  # type: ignore[arg-type]
+    assert FakeStream.instances == []  # The lights were never taken.
+
+
 def test_lights_play_in_the_users_order_then_the_rest():
     area = Area(AREA.id, "Area", {0: "a", 1: "b", 2: "c", 3: "d"})
     assert show.in_order(area, ["c", "a", "unknown"]) == ["c", "a", "b", "d"]
@@ -283,9 +335,9 @@ async def test_each_beat_reaches_exactly_one_frame(monkeypatch):
     seen: list[bool] = []
     real_frame = Renderer.frame
 
-    def recording(self, now, sound, screens, pressure=None):
+    def recording(self, now, sound, screens, pressure=None, race=None):
         seen.append(sound.beat)
-        return real_frame(self, now, sound, screens, pressure)
+        return real_frame(self, now, sound, screens, pressure, race)
 
     monkeypatch.setattr(Renderer, "frame", recording)
     listeners: list[FakeListener] = []
