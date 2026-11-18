@@ -283,3 +283,25 @@ def test_idle_dates_the_last_input_to_before_the_timeout():
     assert tracker.at(101) == Activity(known=True, idle=False, last_input=101)
     tracker.lost()
     assert not tracker.at(102).known
+
+
+def test_a_paused_session_stands_still_and_resumes_with_its_time_left():
+    s = in_break()
+    t0 = s.phase_started
+    s.pause(t0 + 100)
+    s.pause(t0 + 150)  # Pausing twice keeps the first pause.
+    assert s.advance(t0 + 10_000, active(t0 + 10_000), "midday") == []
+    assert s.due_nudge(t0 + 10_000, active(t0 + 10_000)) is None
+    s.resume(t0 + 1100)
+    s.resume(t0 + 1200)  # Resuming twice changes nothing.
+    assert s.deadline() == pytest.approx(t0 + 1000 + SHORT)
+
+
+def test_a_paused_session_is_saved_and_restored_paused():
+    s = session()
+    s.last_nudge = START
+    s.pause(START + 60)
+    restored = Session.from_json(s.to_json(START + 100, 5000.0), 7.0, 5000.0)
+    assert restored.paused_at == pytest.approx(7.0 - 40)
+    restored.resume(10.0)
+    assert restored.paused_at is None

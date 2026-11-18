@@ -98,6 +98,39 @@ def resources() -> list[dict[str, Any]]:
     return json.loads((Path(__file__).parent / "fixtures" / "resource.json").read_text())
 
 
+AREA_ID = "a1b2c3d4-0000-4000-8000-000000000001"
+
+
+def with_entertainment_area(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The fixture home plus an entertainment area streaming to the living room's two lights,
+    the way the bridge describes one: channels reach lights through entertainment services."""
+    services = [
+        {
+            "type": "entertainment",
+            "id": f"ent-{device}",
+            "owner": {"rid": device, "rtype": "device"},
+        }
+        for device in ("dev-floor", "dev-ceiling")
+    ]
+    channels = [
+        {
+            "channel_id": channel,
+            "position": {"x": 0, "y": 0, "z": 0},
+            "members": [{"service": {"rid": service["id"], "rtype": "entertainment"}, "index": 0}],
+        }
+        for channel, service in enumerate(services)
+    ]
+    area = {
+        "type": "entertainment_configuration",
+        "id": AREA_ID,
+        "metadata": {"name": "Movie area"},
+        "configuration_type": "screen",
+        "status": "inactive",
+        "channels": channels,
+    }
+    return [*resources, *services, area]
+
+
 @pytest.fixture
 def fake_bridge(resources: list[dict[str, Any]]) -> FakeBridge:
     return FakeBridge(resources)

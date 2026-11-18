@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -8,12 +9,15 @@ from typing import Any
 
 from hue_mcp.errors import HueError
 
+CLIENT_KEY = re.compile(r"[0-9A-Fa-f]{32}")  # 16 bytes, the streaming key.
+
 
 @dataclass(frozen=True)
 class BridgeConfig:
     bridge_id: str
     ip: str
     app_key: str
+    client_key: str | None = None  # For streaming light shows; pairings before them lack it.
 
 
 @dataclass(frozen=True)
@@ -61,8 +65,11 @@ def load_config() -> BridgeConfig | None:
         return None
     except (OSError, ValueError, TypeError) as error:
         raise HueError(f"{path} is unreadable ({error}); run `hue-mcp setup` again.") from error
-    if not all(isinstance(value, str) and value for value in asdict(config).values()):
+    required = (config.bridge_id, config.ip, config.app_key)
+    if not all(isinstance(value, str) and value for value in required):
         raise HueError(f"{path} is incomplete; run `hue-mcp setup` again.")
+    if config.client_key is not None and not CLIENT_KEY.fullmatch(str(config.client_key)):
+        raise HueError(f"{path} has a malformed client key; run `hue-mcp setup` again.")
     return config
 
 
@@ -84,6 +91,52 @@ def load_location() -> Location | None:
 
 def save_location(location: Location) -> None:
     atomic_write_json(location_path(), asdict(location))
+
+
+def placements_path() -> Path:
+    return config_dir() / "show.json"
+
+
+def load_placements() -> dict[str, dict[str, Any]]:
+    """Each light's part of the screen and brightness cap for light shows, by light id."""
+    path = placements_path()
+    try:
+        placements = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        raise HueError(f"{path} is unreadable ({error}); place the lights again.") from error
+    if not isinstance(placements, dict) or not all(
+        isinstance(placement, dict) for placement in placements.values()
+    ):
+        raise HueError(f"{path} isn't a list of placements; place the lights again.")
+    return placements
+
+
+def save_placements(placements: dict[str, dict[str, Any]]) -> None:
+    atomic_write_json(placements_path(), placements)
+
+
+def show_order_path() -> Path:
+    return config_dir() / "show_order.json"
+
+
+def load_show_order() -> list[str]:
+    """The light ids in the order the user gave for light shows; empty when none."""
+    path = show_order_path()
+    try:
+        order = json.loads(path.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        raise HueError(f"{path} is unreadable ({error}); set the lights' order again.") from error
+    if not isinstance(order, list) or not all(isinstance(light, str) for light in order):
+        raise HueError(f"{path} isn't a list of lights; set the lights' order again.")
+    return order
+
+
+def save_show_order(light_ids: list[str]) -> None:
+    atomic_write_json(show_order_path(), light_ids)
 
 
 def _finite(value: object) -> bool:

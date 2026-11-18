@@ -110,3 +110,37 @@ async def test_changing_lights_works_without_a_watcher(client, fake_bridge):
     result = await call(client, "set_lights", target="Bedside", on=True)
     assert "warnings" not in result
     assert fake_bridge.writes
+
+
+async def test_light_show_tools_ask_the_watcher(client, fake_watcher):
+    fake_watcher.replies.update(show_start={"playing": "x"}, show_stop={}, show_place={})
+    await call(client, "start_light_show", mode="cpu")
+    await call(client, "stop_light_show")
+    await call(client, "place_show_light", light="Floor lamp", region="left", screen=3)
+    assert fake_watcher.requests == [
+        ("show_start", {"mode": "cpu", "room": None}),
+        ("show_stop", {}),
+        (
+            "show_place",
+            {"light": "Floor lamp", "region": "left", "screen": 3, "max_brightness": 100},
+        ),
+    ]
+    assert fake_watcher.timeouts[0] > 180  # Outwaits the screen-sharing question.
+
+
+async def test_changing_a_light_in_a_show_says_the_show_undoes_it(client, fake_watcher):
+    fake_watcher.replies["touched"] = {"show": "music"}
+    result = await call(client, "set_lights", target="Floor lamp", on=True)
+    assert result["warnings"] == [
+        "A music light show is streaming there, so this won't show; when it ends, the lights "
+        "go back to how they were before it."
+    ]
+
+
+async def test_a_change_across_a_show_and_a_pomodoro_gets_both_notes(client, fake_watcher):
+    fake_watcher.replies["touched"] = {"show": "cpu", "room": "Bedroom", "look": "midday"}
+    result = await call(client, "set_lights", target="all", on=True)
+    assert [note.split(",")[0] for note in result["warnings"]] == [
+        "A cpu light show is streaming there",
+        "A pomodoro is running in Bedroom; this change lasts until its next switch or nudge",
+    ]

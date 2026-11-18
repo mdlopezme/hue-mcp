@@ -121,6 +121,7 @@ class Session:
     phase_started: float
     band: Band  # The part of the day the current look was picked for.
     look: str  # The scene the room should show.
+    paused_at: float | None = None  # A light show holds the room; the clock stands still.
     last_nudge: float | None = field(default=None, compare=False)
     dipped: bool = field(default=False, compare=False)
     _changed: bool = field(default=False, compare=False, repr=False)
@@ -152,6 +153,8 @@ class Session:
         """Move through every phase that has ended by `now`: after a suspend, several may have."""
         events: list[Event] = []
         self._changed = False
+        if self.paused_at is not None:
+            return events
         while True:
             deadline = self.deadline()
             if self.phase == "focus" and deadline is not None and now >= deadline:
@@ -178,6 +181,8 @@ class Session:
 
     def due_nudge(self, now: float, activity: Activity) -> Nudge | None:
         """The nudge to play now, if one is due; a nudge returned counts as played."""
+        if self.paused_at is not None:
+            return None
         if self.phase == "waiting":
             if now - self.phase_started < RED_AFTER_S:
                 return None
@@ -219,6 +224,9 @@ class Session:
             "phase_started_wall": wall_now - (now - self.phase_started),
             "band": self.band,
             "look": self.look,
+            "paused_at_wall": (
+                None if self.paused_at is None else wall_now - (now - self.paused_at)
+            ),
             "saved_at_wall": wall_now,
         }
 
@@ -235,12 +243,31 @@ class Session:
                 phase_started=now - (wall_now - float(data["phase_started_wall"])),
                 band=data["band"],
                 look=str(data["look"]),
+                paused_at=(
+                    None
+                    if data.get("paused_at_wall") is None
+                    else now - (wall_now - float(data["paused_at_wall"]))
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise HueError(f"The saved pomodoro is unreadable ({error}).") from error
         if session.phase not in PHASES or session.band not in BANDS:
             raise HueError("The saved pomodoro has an unknown phase or part of the day.")
         return session
+
+    def pause(self, now: float) -> None:
+        if self.paused_at is None:
+            self.paused_at = now
+
+    def resume(self, now: float) -> None:
+        """Carry on where the pause left off: the phase keeps the time it had left."""
+        if self.paused_at is None:
+            return
+        paused_for = now - self.paused_at
+        self.phase_started += paused_for
+        if self.last_nudge is not None:
+            self.last_nudge += paused_for
+        self.paused_at = None
 
     def _next_round(self, now: float, band: Band) -> None:
         """After the last round's long break, a new set of rounds starts."""

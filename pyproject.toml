@@ -11,7 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "anyio>=4.5,<5",
+    "anyio>=4.7,<5",
     "astral>=3.2,<4",
     "httpx2>=2.13,<3",
     "mcp>=2.2,<3",
@@ -51,6 +51,11 @@ known-local-folder = ["conftest"]
 files = ["src", "scripts"]
 strict = true
 
+[[tool.mypy.overrides]]
+# The screen capture helper runs on the system Python, whose PyGObject isn't in the venv.
+module = ["gi", "gi.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-markers"]
@@ -59,6 +64,9 @@ filterwarnings = ["error"]
 [tool.coverage.run]
 source = ["hue_mcp"]
 branch = true
+# Runs on the system Python, with the desktop's screen sharing; checked by hand and by the
+# test that keeps its constants in step with hue_mcp.screen.
+omit = ["*/hue_mcp/screen_capture.py"]
 
 [tool.coverage.report]
 show_missing = true

@@ -52,6 +52,20 @@ class HueBridge:
         resources, _ = await self._v2("GET", "resource")
         return resources
 
+    async def application_id(self) -> str:
+        """This app's id on the bridge, which streaming uses as its PSK identity."""
+        response = await self._send("GET", "/auth/v1", None)
+        if response.status_code in (401, 403):
+            raise HueError(RE_PAIR_HINT)
+        application_id = response.headers.get("hue-application-id")
+        if response.is_error or not application_id:
+            raise HueError(f"The bridge didn't say this app's id (HTTP {response.status_code}).")
+        return str(application_id)
+
+    async def get_resource(self, rtype: str, rid: str) -> dict[str, Any] | None:
+        resources, _ = await self._v2("GET", f"resource/{rtype}/{rid}")
+        return resources[0] if resources else None
+
     async def get_lights(self) -> list[dict[str, Any]]:
         """Only the light resources: a much smaller read than the whole home."""
         lights, _ = await self._v2("GET", "resource/light")

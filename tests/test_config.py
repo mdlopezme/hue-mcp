@@ -8,9 +8,15 @@ from hue_mcp.config import (
     config_path,
     load_config,
     load_location,
+    load_placements,
+    load_show_order,
     location_path,
+    placements_path,
     save_config,
     save_location,
+    save_placements,
+    save_show_order,
+    show_order_path,
 )
 from hue_mcp.errors import HueError
 
@@ -137,3 +143,51 @@ def test_an_unusable_location_says_how_to_fix_it(content):
     location_path().write_text(content)
     with pytest.raises(HueError, match="set-location"):
         load_location()
+
+
+def test_older_pairings_have_no_client_key_and_still_load():
+    config_path().parent.mkdir(parents=True)
+    config_path().write_text(
+        '{"bridge_id": "001788fffe123456", "ip": "192.168.1.50", "app_key": "k"}'
+    )
+    config = load_config()
+    assert config is not None
+    assert config.client_key is None
+
+
+def test_a_malformed_client_key_says_how_to_fix_it():
+    config_path().parent.mkdir(parents=True)
+    config_path().write_text(
+        '{"bridge_id": "001788fffe123456", "ip": "192.168.1.50", "app_key": "k", '
+        '"client_key": "not-hex"}'
+    )
+    with pytest.raises(HueError, match="malformed client key"):
+        load_config()
+
+
+def test_placements_round_trip_and_start_empty():
+    assert load_placements() == {}
+    save_placements({"light-1": {"region": "left", "screen": 2, "max_brightness": 0.6}})
+    assert load_placements() == {"light-1": {"region": "left", "screen": 2, "max_brightness": 0.6}}
+
+
+@pytest.mark.parametrize("content", ["{oops", "[1, 2]", '{"light-1": "left"}'])
+def test_unusable_placements_say_how_to_fix_it(content):
+    placements_path().parent.mkdir(parents=True)
+    placements_path().write_text(content)
+    with pytest.raises(HueError, match="place the lights again"):
+        load_placements()
+
+
+def test_the_show_order_round_trips_and_starts_empty():
+    assert load_show_order() == []
+    save_show_order(["light-2", "light-1"])
+    assert load_show_order() == ["light-2", "light-1"]
+
+
+@pytest.mark.parametrize("content", ["{oops", '{"a": 1}', "[1, 2]"])
+def test_an_unusable_show_order_says_how_to_fix_it(content):
+    show_order_path().parent.mkdir(parents=True)
+    show_order_path().write_text(content)
+    with pytest.raises(HueError, match="order again"):
+        load_show_order()

@@ -20,7 +20,7 @@ from hue_mcp.session import AWAY_LIMIT_S, IDLE_TIMEOUT_S
 from hue_mcp.watcher import NOT_RUNNING, Watcher, ask_watcher, notify_desktop, rounds_by_day
 from hue_mcp.wayland_idle import WaylandError
 
-from conftest import CONFIG, FakeBridge, resource
+from conftest import AREA_ID, CONFIG, FakeBridge, resource, with_entertainment_area
 
 pytestmark = pytest.mark.anyio
 
@@ -139,10 +139,13 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime_dir: Path)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     for constant in (
         "SETTLE_INTERVAL_S",
+        "REPORT_LAG_INTERVAL_S",
         "PULSE_HOLD_S",
         "DIP_HOLD_S",
         "PULSE_BACK_S",
         "DIP_BACK_S",
+        "AFTER_STREAM_S",
+        "RESTORE_CHECK_AFTER_S",
     ):
         monkeypatch.setattr(watcher_module, constant, 0)
     save_location(PLACE)
@@ -150,7 +153,7 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime_dir: Path)
 
 @pytest.fixture
 def live(resources: list[dict[str, Any]]) -> LiveBridge:
-    return LiveBridge(resources)
+    return LiveBridge(with_entertainment_area(resources))
 
 
 class Harness:
@@ -863,6 +866,33 @@ async def test_red_pulses_run_back_to_back_each_fading_back_with_the_scene(harne
     assert pulses == red_and_back * (len(pulses) // 2)
 
 
+async def test_a_light_still_reported_midway_back_from_a_pulse_isnt_taken_for_a_change(harness):
+    w, live = harness.watcher, harness.live
+    async with anyio.create_task_group() as tg:
+        await waiting(harness, tg)
+        floor_look = next(
+            action["action"]
+            for action in live.scene_named("Pomodoro short break")["actions"]
+            if action["target"]["rid"] == "light-floor"
+        )
+        # How a real bridge went on reporting a bulb for about 4 s after a red pulse's way back.
+        midway = {"color": {"xy": {"x": 0.353, "y": 0.222}}, "dimming": {"brightness": 32}}
+        live.set_light("light-floor", midway)
+        reads = 0
+
+        def catch_up() -> None:
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                live.set_light("light-floor", floor_look)
+
+        live.before_each_read = catch_up
+        await harness.tick_through(12, tg, idle=True)
+    assert w.session is not None
+    assert w.session.phase == "waiting"
+    assert shows_scene(live, "Pomodoro short break")
+
+
 async def test_a_pulse_that_couldnt_get_back_is_restored_later(harness):
     w, live = harness.watcher, harness.live
     await w.handle({"command": "start", **START})
@@ -981,3 +1011,464 @@ async def test_a_long_phase_keeps_its_saved_state_fresh(harness):
     async with anyio.create_task_group() as tg:
         await harness.tick_through(61, tg)
     assert json.loads(path.read_text())["saved_at_wall"] > saved
+
+
+# Light shows: run_show is replaced by a stand-in that plays until told why to end.
+
+
+STATE_FILES = ("light_show.json", "pomodoro.json")
+
+
+class FakeShow:
+    """Stands in for show.run_show; `fail` makes it fail before or after starting."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.fail_before_start: Exception | None = None
+
+    async def __call__(self, bridge, area, mode, placements, should_end, started, order) -> str:
+        self.calls.append((mode, placements))
+        if self.fail_before_start is not None:
+            raise self.fail_before_start
+        started()
+        while True:  # Like the real show: one look at should_end per frame.
+            if (reason := should_end()) is not None:
+                return reason
+            await anyio.sleep(0.01)
+
+
+@pytest.fixture
+def fake_show(monkeypatch: pytest.MonkeyPatch) -> FakeShow:
+    fake = FakeShow()
+    monkeypatch.setattr(watcher_module, "run_show", fake)
+    return fake
+
+
+def light_state(live: LiveBridge, light_id: str) -> tuple[Any, Any]:
+    light = resource(live.resources, light_id)
+    return light["on"]["on"], light["dimming"]["brightness"]
+
+
+async def test_a_show_pauses_the_pomodoro_and_hands_the_room_back_after(harness, fake_show):
+    w, live = harness.watcher, harness.live
+    await w.handle({"command": "start", **START})
+    before = {light: light_state(live, light) for light in ("light-floor", "light-ceiling")}
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        result = await w.handle({"command": "show_start", "mode": "music"})
+        assert result == {
+            "playing": "the music light show",
+            "area": "Movie area",
+            "note": "The pomodoro is paused, and carries on when the show ends.",
+        }
+        assert w.session is not None
+        assert w.session.paused_at is not None
+        assert (state_dir() / "light_show.json").exists()
+        status = await w.handle({"command": "status", "days": 1})
+        assert status["light_show"]["mode"] == "music"
+        assert "Paused while a light show runs" in status["note"]
+        live.set_light("light-floor", {"dimming": {"brightness": 3}})  # What a show does.
+        assert await w.handle({"command": "show_stop"}) == {"stopped": "the music light show"}
+    assert {light: light_state(live, light) for light in before} == before
+    assert w.session.paused_at is None
+    assert not (state_dir() / "light_show.json").exists()
+    with pytest.raises(HueError, match="No light show is running"):
+        await w.handle({"command": "show_stop"})
+
+
+async def test_a_paused_pomodoros_clock_stands_still(harness, fake_show):
+    w = harness.watcher
+    await w.handle({"command": "start", **START})
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "screen"})
+        harness.advance(FOCUS_S * 3)
+        await w.tick(tg)
+        assert w.session is not None
+        assert w.session.phase == "focus"  # Not a break: the clock stood still.
+        await w.handle({"command": "show_stop"})
+    assert w.session.deadline() == pytest.approx(harness.clock.now + FOCUS_S)
+
+
+async def test_a_show_that_cant_start_says_why_and_leaves_no_trace(harness, fake_show):
+    w = harness.watcher
+    await w.handle({"command": "start", **START})
+    fake_show.fail_before_start = HueError("The screen wasn't shared.")
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        with pytest.raises(HueError, match="wasn't shared"):
+            await w.handle({"command": "show_start", "mode": "screen"})
+    assert w._show is None
+    assert w.session is not None
+    assert w.session.paused_at is None
+    assert harness.notifications[-1][0] != "Light show ended"  # The reply said it already.
+
+
+async def test_a_crash_inside_the_show_ends_it_not_the_watcher(harness, fake_show):
+    w = harness.watcher
+    fake_show.fail_before_start = RuntimeError("boom")
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        with pytest.raises(HueError, match="RuntimeError"):
+            await w.handle({"command": "show_start", "mode": "music"})
+    assert w._show is None
+
+
+async def test_fifteen_minutes_away_ends_the_show_with_a_note(harness, fake_show):
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        assert w._show is not None
+        run = w._show
+        w.tracker.idled(harness.clock.now)
+        harness.advance(watcher_module.SHOW_AWAY_LIMIT_S + 5)
+        with anyio.fail_after(5):
+            await run.done.wait()
+    assert harness.notifications[-1] == (
+        "Light show ended",
+        "You were away for 15 minutes, so the light show ended.",
+    )
+
+
+async def test_a_suspend_ends_the_show(harness, fake_show, monkeypatch):
+    monkeypatch.setattr(watcher_module, "RESUME_HOLD_S", 0)  # The hand-back waits it out.
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        assert w._show is not None
+        run = w._show
+        await w.tick(tg)
+        harness.suspend(600)
+        await w.tick(tg)
+        with anyio.fail_after(5):
+            await run.done.wait()
+    assert "slept" in harness.notifications[-1][1]
+
+
+async def test_a_new_show_replaces_the_running_one(harness, fake_show):
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        first = w._show
+        await w.handle({"command": "show_start", "mode": "both"})
+        assert first is not None
+        assert first.done.is_set()
+        assert w._show is not None
+        assert w._show.mode == "both"
+        await w.handle({"command": "show_stop"})
+
+
+async def test_claude_changing_a_show_light_hears_that_a_show_is_on(harness, fake_show):
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "screen"})
+        assert await w.handle({"command": "touched", "lights": ["light-floor"]}) == {
+            "show": "screen"
+        }
+        await w.handle({"command": "show_stop"})
+
+
+@pytest.mark.parametrize(
+    ("request_", "error"),
+    [
+        ({"mode": "disco"}, "mode must be one of"),
+        ({"mode": "music", "room": 3}, "room must be"),
+        ({"mode": "music", "room": "Bedroom"}, "No entertainment area holds"),
+    ],
+)
+async def test_a_show_request_is_checked(harness, fake_show, request_, error):
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        with pytest.raises(HueError, match=error):
+            await w.handle({"command": "show_start", **request_})
+
+
+async def test_a_show_needs_the_watchers_tasks(harness):
+    with pytest.raises(HueError, match="isn't running its tasks"):
+        await harness.watcher.handle({"command": "show_start", "mode": "music"})
+
+
+async def test_without_an_area_or_with_several_the_room_must_be_named(harness, fake_show):
+    w, live = harness.watcher, harness.live
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        second = {**resource(live.resources, AREA_ID), "id": AREA_ID.replace("1", "2")}
+        live.resources.append(second)
+        with pytest.raises(HueError, match="Several entertainment areas"):
+            await w.handle({"command": "show_start", "mode": "music"})
+        live.resources[:] = [
+            r for r in live.resources if r["type"] != "entertainment_configuration"
+        ]
+        with pytest.raises(HueError, match="no entertainment area"):
+            await w.handle({"command": "show_start", "mode": "music"})
+
+
+async def test_lights_are_placed_and_the_placements_reach_the_show(harness, fake_show):
+    w = harness.watcher
+    placed = await w.handle(
+        {
+            "command": "show_place",
+            "light": "Floor lamp",
+            "region": "left",
+            "screen": 2,
+            "max_brightness": 60,
+        }
+    )
+    assert placed == {
+        "placed": "Floor lamp",
+        "follows": "left of screen 2 from the left",
+        "max_brightness": 60,
+    }
+    await w.handle({"command": "show_place", "light": "Ceiling", "region": "whole"})
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "screen"})
+        await w.handle({"command": "show_stop"})
+    [(_, placements)] = fake_show.calls
+    assert placements == {
+        "light-floor": watcher_module.Placement("left", 2, 0.6),
+        "light-ceiling": watcher_module.Placement("whole", None, 1.0),
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_", "error"),
+    [
+        ({"light": 5, "region": "left"}, "name of a light"),
+        ({"light": "Ceiling", "region": "sky"}, "region must be one of"),
+        ({"light": "Ceiling", "region": "left", "screen": 0}, "screen must be"),
+        ({"light": "Ceiling", "region": "left", "max_brightness": "lots"}, "whole percentage"),
+        ({"light": "Ceiling", "region": "left", "max_brightness": 0}, "from 1 to 100"),
+    ],
+)
+async def test_a_placement_is_checked(harness, request_, error):
+    with pytest.raises(HueError, match=error):
+        await harness.watcher.handle({"command": "show_place", **request_})
+
+
+def test_damaged_placements_are_skipped():
+    from hue_mcp.config import save_placements
+
+    save_placements(
+        {
+            "good": {"region": "top", "screen": 1, "max_brightness": 0.5},
+            "bad-region": {"region": "sky"},
+            "bad-screen": {"region": "top", "screen": "one"},
+            "bad-brightness": {"region": "top", "max_brightness": 2},
+        }
+    )
+    assert watcher_module._placements() == {"good": watcher_module.Placement("top", 1, 0.5)}
+
+
+async def test_a_show_cut_off_by_a_restart_hands_the_room_back(harness, fake_show):
+    w, live = harness.watcher, harness.live
+    await w.handle({"command": "start", **START})
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        saved = {name: (state_dir() / name).read_text() for name in STATE_FILES}
+        await w.handle({"command": "show_stop"})
+    for name, text in saved.items():  # As if the watcher had crashed mid-show.
+        (state_dir() / name).write_text(text)
+    live.set_light("light-floor", {"on": {"on": False}})
+    restarted = Harness(live)
+    restarted.watcher.restore()
+    assert restarted.watcher.session is not None
+    assert restarted.watcher.session.paused_at is not None
+    await restarted.watcher.recover_show()
+    assert light_state(live, "light-floor")[0] is True
+    assert restarted.watcher.session.paused_at is None
+    stops = [body for _, path, body in live.writes if path.endswith(AREA_ID)]
+    assert stops[-1] == {"action": "stop"}
+    assert not (state_dir() / "light_show.json").exists()
+
+
+async def test_an_unreadable_saved_show_is_dropped(harness):
+    path = state_dir() / "light_show.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{oops")
+    await harness.watcher.recover_show()
+    assert not path.exists()
+
+
+async def test_the_lights_order_is_saved_and_reaches_the_show(harness, monkeypatch):
+    seen = []
+
+    async def recording(bridge, area, mode, placements, should_end, started, order) -> str:
+        seen.append(order)
+        started()
+        return "done"
+
+    monkeypatch.setattr(watcher_module, "run_show", recording)
+    w = harness.watcher
+    assert await w.handle({"command": "show_order", "lights": ["Ceiling", "Floor lamp"]}) == {
+        "order": ["Ceiling", "Floor lamp"]
+    }
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "cpu"})
+    assert seen == [["light-ceiling", "light-floor"]]
+
+
+@pytest.mark.parametrize(
+    ("lights", "error"),
+    [
+        ([], "list of light names"),
+        ("Ceiling", "list of light names"),
+        (["Ceiling", "Ceiling"], "twice"),
+    ],
+)
+async def test_an_order_is_checked(harness, lights, error):
+    with pytest.raises(HueError, match=error):
+        await harness.watcher.handle({"command": "show_order", "lights": lights})
+
+
+async def test_a_cpu_show_stays_on_while_nobody_is_there(harness, fake_show):
+    w = harness.watcher
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "cpu"})
+        assert w._show is not None
+        w.tracker.idled(harness.clock.now)
+        harness.advance(watcher_module.SHOW_AWAY_LIMIT_S * 4)
+        assert w._show_should_end(w._show) is None
+        await w.handle({"command": "show_stop"})
+
+
+class SlowShow(FakeShow):
+    """A show whose start waits until released, like one waiting on the screen dialog."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = anyio.Event()
+
+    async def __call__(self, bridge, area, mode, placements, should_end, started, order) -> str:
+        await self.release.wait()
+        return await super().__call__(bridge, area, mode, placements, should_end, started, order)
+
+
+async def test_two_starts_at_once_leave_one_show_and_nothing_orphaned(harness, monkeypatch):
+    slow = SlowShow()
+    monkeypatch.setattr(watcher_module, "run_show", slow)
+    w = harness.watcher
+    replies: list[Any] = []
+    both_answered = anyio.Event()
+
+    async def start(mode: str) -> None:
+        try:
+            replies.append(await w.handle({"command": "show_start", "mode": mode}))
+        except HueError as error:
+            replies.append(str(error))
+        if len(replies) == 2:
+            both_answered.set()
+
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        tg.start_soon(start, "music")
+        await anyio.wait_all_tasks_blocked()
+        tg.start_soon(start, "cpu")
+        await anyio.wait_all_tasks_blocked()
+        slow.release.set()
+        with anyio.fail_after(5):
+            await both_answered.wait()
+        assert w._show is not None
+        assert w._show.mode == "cpu"
+        await w.handle({"command": "show_stop"})
+    assert "stopped before it started" in replies[0]
+    assert replies[1]["playing"] == "the cpu light show"
+    assert w._show is None
+
+
+async def test_a_pomodoro_started_during_a_show_waits_for_it(harness, fake_show):
+    w, live = harness.watcher, harness.live
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        status = await w.handle({"command": "start", **START})
+        assert "Paused while a light show runs" in status["note"]
+        assert live.puts("scene") == []  # The show has the lights.
+        await w.handle({"command": "show_stop"})
+        await w.tick(tg)
+    assert w.session is not None
+    assert w.session.paused_at is None
+    assert shows_scene(live, "Pomodoro midday")
+
+
+async def test_a_failed_hand_back_neither_hangs_nor_kills_the_watcher(harness, fake_show, caplog):
+    w = harness.watcher
+
+    async def broken(snapshot: Any) -> None:
+        raise OSError("disk full")
+
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        await w.handle({"command": "show_start", "mode": "music"})
+        w._restore_room = broken  # type: ignore[method-assign]
+        with anyio.fail_after(5):
+            await w.handle({"command": "show_stop"})
+    assert "Handing the room back after the light show failed" in caplog.text
+
+
+async def test_a_pomodoro_left_paused_without_a_show_carries_on_at_start(harness, fake_show):
+    w = harness.watcher
+    await w.handle({"command": "start", **START})
+    assert w.session is not None
+    w.session.pause(harness.clock.now)
+    w._save()
+    restarted = Harness(harness.live)
+    restarted.watcher.restore()
+    await restarted.watcher.recover_show()
+    assert restarted.watcher.session is not None
+    assert restarted.watcher.session.paused_at is None
+
+
+async def test_a_change_across_a_show_and_a_pomodoro_is_handled_for_both(harness, fake_show):
+    w, live = harness.watcher, harness.live
+    resource(live.resources, "room-living")["children"] = [{"rid": "dev-floor", "rtype": "device"}]
+    await w.handle({"command": "start", **START, "task_light": None})
+    async with anyio.create_task_group() as tg:
+        w._task_group = tg
+        area_lights = resource(live.resources, AREA_ID)["channels"]
+        area_lights.pop(0)  # The show takes only the ceiling light.
+        await w.handle({"command": "show_start", "mode": "cpu"})
+        reply = await w.handle({"command": "touched", "lights": ["light-floor", "light-ceiling"]})
+        assert reply == {"show": "cpu", "room": "Living room", "look": "midday"}
+        await w.handle({"command": "show_stop"})
+
+
+async def test_a_damaged_placements_file_is_started_over(harness):
+    from hue_mcp.config import placements_path
+
+    placements_path().parent.mkdir(parents=True, exist_ok=True)
+    placements_path().write_text("{oops")
+    placed = await harness.watcher.handle(
+        {"command": "show_place", "light": "Ceiling"} | {"region": "top"}
+    )
+    assert placed["placed"] == "Ceiling"
+
+
+async def test_a_light_that_missed_a_dips_way_back_is_resent_not_taken_for_the_switch(harness):
+    w, live = harness.watcher, harness.live
+    async with anyio.create_task_group() as tg:
+        await waiting(harness, tg)
+        brightness = resource(live.resources, "light-floor")["dimming"]["brightness"]
+        live.set_light("light-floor", {"dimming": {"brightness": max(1, brightness - 30)}})
+        await harness.tick_through(12, tg, idle=True)
+    assert w.session is not None  # Still waiting, not ended as "changed at the switch".
+    assert shows_scene(live, "Pomodoro short break")
+
+
+async def test_a_light_that_missed_the_first_switch_gets_it_again(harness):
+    w, live = harness.watcher, harness.live
+    live.deaf = {"light-floor"}
+    await w.handle({"command": "start", **START})
+    live.deaf = set()
+    assert not shows_scene(live, "Pomodoro midday")
+    async with anyio.create_task_group() as tg:
+        await harness.tick_through(7, tg)
+    assert shows_scene(live, "Pomodoro midday")

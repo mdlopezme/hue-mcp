@@ -22,10 +22,20 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 
 from hue_mcp import looks
 from hue_mcp.bridge import HueBridge
-from hue_mcp.config import atomic_write_json, load_location, state_dir
+from hue_mcp.config import (
+    atomic_write_json,
+    load_location,
+    load_placements,
+    load_show_order,
+    save_placements,
+    save_show_order,
+    state_dir,
+)
 from hue_mcp.daylight import Band, band_at
+from hue_mcp.entertainment import Area, area_for, areas
 from hue_mcp.errors import HueError
 from hue_mcp.home import Group, Home, Light, Scene
+from hue_mcp.screen import REGIONS
 from hue_mcp.session import (
     AWAY_LIMIT_S,
     IDLE_TIMEOUT_S,
@@ -38,6 +48,7 @@ from hue_mcp.session import (
     Session,
     is_positive_number,
 )
+from hue_mcp.show import MODES, Mode, Placement, run_show
 from hue_mcp.wayland_idle import WaylandError, idle_changes
 
 logger = logging.getLogger(__name__)
@@ -60,12 +71,22 @@ RECONNECT_MAX_S = 60.0
 OFF_FADE_MS = 10_000
 SETTLE_TRIES = 5  # Reads, SETTLE_INTERVAL_S apart, to wait out a fade before saving a look.
 SETTLE_INTERVAL_S = 1.0
+# The bridge can go on reporting a light midway through a fade for seconds after it ended (up
+# to about 4 s seen), so a light that seems changed is read again before it counts as changed.
+REPORT_LAG_TRIES = 10
+REPORT_LAG_INTERVAL_S = 1.0
 REQUEST_LIMIT_BYTES = 64 * 1024
 CLIENT_TIMEOUT_S = 60.0  # Starting a session may create nine scenes.
+REQUEST_READ_TIMEOUT_S = 10.0
 NOTIFY_TIMEOUT_S = 5.0
 MOST_MINUTES = {"focus_minutes": 120, "short_break_minutes": 60, "long_break_minutes": 120}
 MOST_ROUNDS = 8
 MOST_DAYS = 366
+SHOW_AWAY_LIMIT_S = 15 * 60  # Away this long, and a light show ends.
+AFTER_STREAM_S = 1.5  # The bridge sets the lights itself just after a stream; wait it out.
+RESTORE_CHECK_AFTER_S = 3.0  # Then, once the lights have faded back, check they all did.
+SHOW_START_TIMEOUT_S = 180.0  # Room for the desktop's screen-sharing question.
+SHOW_REPLY_TIMEOUT_S = SHOW_START_TIMEOUT_S + 15  # Clients outwait the watcher's own limit.
 
 NOT_RUNNING = (
     "The pomodoro watcher isn't running. Ask the user to run `hue-mcp install-watcher` in a "
@@ -130,6 +151,35 @@ async def ask_watcher(
     return result
 
 
+class _ShowRun:
+    def __init__(
+        self,
+        mode: Mode,
+        area: Area,
+        snapshot: dict[str, dict[str, Any]],
+        paused_pomodoro: bool,
+        started_at_wall: float,
+    ):
+        self.mode = mode
+        self.area = area
+        self.snapshot = snapshot
+        self.paused_pomodoro = paused_pomodoro
+        self.started_at_wall = started_at_wall
+        self.scope = anyio.CancelScope()
+        self.started = anyio.Event()  # The stream is up, or the start failed (see error).
+        self.done = anyio.Event()  # The room is handed back.
+        self.error: str | None = None
+        self.end_reason: str | None = None
+
+    def saved(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "area_id": self.area.id,
+            "snapshot": self.snapshot,
+            "paused_pomodoro": self.paused_pomodoro,
+        }
+
+
 class Watcher:
     def __init__(
         self,
@@ -156,11 +206,16 @@ class Watcher:
         self._switch_due: float | None = None
         self._verify_due: float | None = None
         self._previous_look: str | None = None  # Lights still showing it missed a switch.
+        # Before a session's first switch there's no previous look: what each light showed.
+        self._before_start: dict[str, dict[str, Any]] = {}
         self._changed_by_claude: set[str] = set()  # Lights to leave be until the next switch.
         self._quiet_until = 0.0
         self._hold_until = 0.0
         self._last_asleep: float | None = None
         self._saved_at = 0.0
+        self._show: _ShowRun | None = None
+        self._show_lock = anyio.Lock()  # One show starts or stops at a time.
+        self._task_group: TaskGroup | None = None  # Set by run(); light shows run in it.
 
     async def run(self) -> None:
         directory = runtime_dir()
@@ -175,7 +230,10 @@ class Watcher:
             listener = await anyio.create_unix_listener(socket_path())
             self.restore()
             async with listener, anyio.create_task_group() as task_group:
+                self._task_group = task_group
                 task_group.start_soon(self.watch_activity)
+                # Before serving, so a new show can't race the hand-back of an old one.
+                await self.recover_show()
                 task_group.start_soon(self._keep_ticking, task_group)
                 await listener.serve(self.serve, task_group)
 
@@ -204,6 +262,8 @@ class Watcher:
             asleep = self._asleep()
             if self._last_asleep is not None and asleep - self._last_asleep > SLEEP_SEEN_S:
                 self._hold_until = now + RESUME_HOLD_S
+                if self._show is not None:
+                    self._show.end_reason = "The computer slept, so the light show ended."
             self._last_asleep = asleep
             session = self.session
             if session is None or now < self._hold_until:
@@ -227,7 +287,7 @@ class Watcher:
                     changes.append(event)
             if changes and session.look != look_before:
                 await self._cancel_pulse(restore=False)
-                self._previous_look = look_before
+                self._previous_look, self._before_start = look_before, {}
                 self._changed_by_claude.clear()
                 self._switch_due, self._verify_due = now, None
             # Waiting keeps the break's look: no switch, so a change at the switch survives.
@@ -246,7 +306,15 @@ class Watcher:
 
     async def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         command = request.get("command")
+        if command == "show_start":  # Takes the lock itself: a show's start can take minutes.
+            return await self._start_show(request)
+        if command == "show_stop":
+            return await self._stop_show()
         async with self._lock:
+            if command == "show_place":
+                return await self._place(request)
+            if command == "show_order":
+                return await self._order(request)
             if command == "start":
                 return await self._start(request)
             if command == "stop":
@@ -272,13 +340,16 @@ class Watcher:
     async def serve(self, stream: ByteStream) -> None:
         async with stream:
             try:
-                with anyio.fail_after(CLIENT_TIMEOUT_S):
+                with anyio.fail_after(REQUEST_READ_TIMEOUT_S):
                     line = await BufferedByteReceiveStream(stream).receive_until(
                         b"\n", REQUEST_LIMIT_BYTES
                     )
-                    request = json.loads(line)
-                    if not isinstance(request, dict):
-                        raise HueError("A request must be a JSON object.")
+                request = json.loads(line)
+                if not isinstance(request, dict):
+                    raise HueError("A request must be a JSON object.")
+                # A show's start bounds its own time: it may wait on the user to share a screen.
+                bound = None if request.get("command") == "show_start" else CLIENT_TIMEOUT_S
+                with anyio.fail_after(bound):
                     reply = {"ok": True, "result": await self.handle(request)}
             except HueError as error:
                 reply = {"ok": False, "error": str(error)}
@@ -347,11 +418,21 @@ class Watcher:
         await self._ensure_scenes(bridge, home, group, task_light.id if task_light else None)
         session = Session.start(group.id, group.name, durations, location, self._clock(), band)
         self.session, self._previous_look = session, None
+        self._before_start = {light.id: looks.current_look(light) for light in group.lights}
         self._changed_by_claude.clear()
-        self._switch_due = self._clock()  # Should the switch below be cut short, ticks retry it.
-        self._save()
-        await self._switch(session)
-        await self._announce(session, PhaseChanged(session.phase, session.round))
+        show = self._show
+        if show is not None and set(show.area.channels.values()) & {
+            light.id for light in group.lights
+        }:
+            session.pause(self._clock())  # The show has the lights; it starts when that ends.
+            show.paused_pomodoro = True
+            atomic_write_json(_show_state_path(), show.saved())
+            self._save()
+        else:
+            self._switch_due = self._clock()  # Should the switch be cut short, ticks retry it.
+            self._save()
+            await self._switch(session)
+            await self._announce(session, PhaseChanged(session.phase, session.round))
         result = self._status(days=0)
         if replaced is not None:
             result["replaced"] = f"the pomodoro that was running in {replaced.room_name}"
@@ -394,17 +475,23 @@ class Watcher:
     async def _touched(self, light_ids: list[str]) -> dict[str, Any]:
         """Claude is about to change these lights: hold off whatever would undo that, and don't
         take it for a change from the switch or the Hue app."""
+        result: dict[str, Any] = {}
+        touched = set(light_ids)
+        show = self._show
+        if show is not None and touched & set(show.area.channels.values()):
+            result["show"] = show.mode
+            touched -= set(show.area.channels.values())
         session = self.session
-        if session is None:
-            return {}
+        if session is None or not touched:
+            return result
         home = Home(await self._get_bridge().get_resources())
         group = _room(home, session.room_id)
-        in_room = set(light_ids) & {light.id for light in group.lights} if group else set()
-        if not in_room:
-            return {}
-        await self._hold_off_for_a_change()
-        self._changed_by_claude |= in_room
-        return {"room": session.room_name, "look": _look_label(session.look)}
+        in_room = touched & {light.id for light in group.lights} if group else set()
+        if in_room:
+            await self._hold_off_for_a_change()
+            self._changed_by_claude |= in_room
+            result.update(room=session.room_name, look=_look_label(session.look))
+        return result
 
     async def _hold_off_for_a_change(self) -> None:
         await self._cancel_pulse(restore=True)
@@ -413,6 +500,9 @@ class Watcher:
 
     def _status(self, days: int) -> dict[str, Any]:
         result: dict[str, Any] = {}
+        if self._show is not None:
+            started = datetime.fromtimestamp(self._show.started_at_wall).astimezone()
+            result["light_show"] = {"mode": self._show.mode, "since": f"{started:%H:%M}"}
         session = self.session
         if session is None:
             result["running"] = False
@@ -425,9 +515,229 @@ class Watcher:
                 result["note"] = "The break is over; the next round starts when the user is back."
             else:
                 result["ends_at"] = self._local_time(deadline)
+            if session.paused_at is not None:
+                result["note"] = "Paused while a light show runs; it carries on afterwards."
         if days > 0:
             result["rounds_by_day"] = rounds_by_day(days)
         return result
+
+    async def _start_show(self, request: dict[str, Any]) -> dict[str, Any]:
+        mode, room = request.get("mode"), request.get("room")
+        if mode not in MODES:
+            raise HueError(f"mode must be one of {', '.join(MODES)}.")
+        if room is not None and not isinstance(room, str):
+            raise HueError("room must be the name of a room or zone.")
+        if self._task_group is None:
+            raise HueError("The watcher isn't running its tasks yet; try again in a moment.")
+        async with self._show_lock:
+            if self._show is not None:
+                await self._end_show(self._show)
+            async with self._lock:
+                bridge = self._get_bridge()
+                resources = await bridge.get_resources()
+                area = _show_area(resources, room)
+                home = Home(resources)
+                in_area = set(area.channels.values())
+                snapshot = {
+                    light.id: looks.current_look(light)
+                    for light in home.lights
+                    if light.id in in_area
+                }
+                paused = self._pause_pomodoro(home, in_area)
+                run = _ShowRun(mode, area, snapshot, paused, self._wall_clock())
+                atomic_write_json(_show_state_path(), run.saved())
+                self._show = run
+                self._task_group.start_soon(self._play_show, run, bridge)
+        with anyio.move_on_after(SHOW_START_TIMEOUT_S):
+            await run.started.wait()
+        if not run.started.is_set():
+            await self._stop_show(run)
+            raise HueError("The light show didn't start in time.")
+        if run.error is not None:
+            raise HueError(run.error)
+        if run.done.is_set():
+            raise HueError("The light show was stopped before it started.")
+        result: dict[str, Any] = {"playing": f"the {mode} light show", "area": area.name}
+        if paused:
+            result["note"] = "The pomodoro is paused, and carries on when the show ends."
+        return result
+
+    def _pause_pomodoro(self, home: Home, lights: set[str]) -> bool:
+        session = self.session
+        group = _room(home, session.room_id) if session is not None else None
+        if session is None or group is None or not lights & {light.id for light in group.lights}:
+            return False
+        if self._pulse is not None:
+            self._pulse.cancel()
+        self._switch_due = self._verify_due = None
+        session.pause(self._clock())
+        self._save()
+        return True
+
+    async def _stop_show(self, run: _ShowRun | None = None) -> dict[str, Any]:
+        async with self._show_lock:
+            run = run or self._show
+            if run is None:
+                raise HueError("No light show is running.")
+            await self._end_show(run)
+        return {"stopped": f"the {run.mode} light show"}
+
+    async def _end_show(self, run: _ShowRun) -> None:
+        run.end_reason = run.end_reason or STOPPED
+        run.scope.cancel()
+        await run.done.wait()
+
+    async def _play_show(self, run: _ShowRun, bridge: HueBridge) -> None:
+        reason: str | None = None
+        try:
+            with run.scope:
+                placements = _placements()
+                reason = await run_show(
+                    bridge,
+                    run.area,
+                    run.mode,
+                    placements,
+                    lambda: self._show_should_end(run),
+                    run.started.set,
+                    load_show_order(),
+                )
+        except Exception as error:  # Any failure ends the show, never the watcher.
+            if not isinstance(error, HueError):
+                logger.exception("The light show failed")
+            reason = str(error) if isinstance(error, HueError) else f"It failed: {error!r}"
+            if not run.started.is_set():
+                run.error = reason
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    # The watcher's own reason (a stop, a sleep) beats what the stream saw.
+                    await self._finish_show(run, run.end_reason or reason)
+                except Exception:
+                    logger.exception("Handing the room back after the light show failed")
+                finally:
+                    run.started.set()
+                    run.done.set()
+
+    def _show_should_end(self, run: _ShowRun) -> str | None:
+        if run.end_reason is not None:
+            return run.end_reason
+        if run.mode == "cpu":  # A monitor, meant to stay on while nobody's there.
+            return None
+        now = self._clock()
+        activity = self.tracker.at(now)
+        if activity.known and activity.idle and now - activity.last_input >= SHOW_AWAY_LIMIT_S:
+            return "You were away for 15 minutes, so the light show ended."
+        return None
+
+    async def _finish_show(self, run: _ShowRun, reason: str | None) -> None:
+        """Hand the room back, as it was before or to the pomodoro the show paused. The saved
+        show goes last, so a crash before then is handed back at the next start."""
+        if (wait_s := self._hold_until - self._clock()) > 0:
+            await anyio.sleep(wait_s)  # Just after a sleep, the network may not be back.
+        async with self._room_lock:
+            await self._restore_room(run.snapshot)
+        async with self._lock:
+            if self._show is run:
+                self._show = None
+            if run.paused_pomodoro and self.session is not None:
+                self.session.resume(self._clock())
+                self._switch_due = self._clock()
+                self._save()
+            if self._show is None:
+                _show_state_path().unlink(missing_ok=True)
+        if run.started.is_set() and run.error is None and reason not in (None, STOPPED):
+            await self._notify("Light show ended", str(reason))
+
+    async def _restore_room(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        """Wait out the bridge's own after-stream state, then put each light back and check."""
+        await anyio.sleep(AFTER_STREAM_S)
+        bridge = self._get_bridge()
+        try:
+            for light_id, action in snapshot.items():
+                body = {**action, "dynamics": {"duration": RESTORE_FADE_MS}}
+                await bridge.update("light", light_id, body)
+            await anyio.sleep(RESTORE_CHECK_AFTER_S)
+            for light in await bridge.get_lights():
+                wanted = snapshot.get(light["id"])
+                if wanted is not None and not looks.shows(light, wanted):
+                    await bridge.update("light", light["id"], wanted)
+        except HueError as error:
+            logger.warning("Couldn't put the lights back after the show: %s", error)
+
+    async def recover_show(self) -> None:
+        """A show a crash or restart cut off: hand the lights back as it would have. And a
+        pomodoro left paused with no show to wait for carries on."""
+        path = _show_state_path()
+        try:
+            saved = json.loads(path.read_text())
+            area_id, snapshot = str(saved["area_id"]), dict(saved["snapshot"])
+            paused = bool(saved["paused_pomodoro"])
+        except FileNotFoundError:
+            self._resume_without_a_show()
+            return
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            logger.warning("Ignoring the saved light show: %s", error)
+            path.unlink(missing_ok=True)
+            self._resume_without_a_show()
+            return
+        try:
+            body = {"action": "stop"}
+            await self._get_bridge().update("entertainment_configuration", area_id, body)
+        except HueError as error:
+            logger.warning("Couldn't stop the interrupted light show: %s", error)
+        run = _ShowRun("music", Area(area_id, "", {}), snapshot, paused, self._wall_clock())
+        await self._finish_show(run, None)
+        self._resume_without_a_show()
+
+    def _resume_without_a_show(self) -> None:
+        if self.session is not None and self.session.paused_at is not None:
+            self.session.resume(self._clock())
+            self._switch_due = self._clock()
+            self._save()
+
+    async def _order(self, request: dict[str, Any]) -> dict[str, Any]:
+        names = request.get("lights")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            raise HueError("order needs a list of light names.")
+        home = Home(await self._get_bridge().get_resources())
+        lights = [home.find_target(name, "light") for name in names]
+        if len({light.id for light in lights}) < len(lights):
+            raise HueError("A light is named twice in that order.")
+        save_show_order([light.id for light in lights])
+        return {"order": [light.name for light in lights]}
+
+    async def _place(self, request: dict[str, Any]) -> dict[str, Any]:
+        name, region = request.get("light"), request.get("region")
+        screen, brightness = request.get("screen"), request.get("max_brightness", 100)
+        if screen is not None and (
+            not isinstance(screen, int) or isinstance(screen, bool) or not 1 <= screen <= 16
+        ):
+            raise HueError("screen must be a monitor's number from the left, starting at 1.")
+        if not isinstance(name, str):
+            raise HueError("place needs the name of a light.")
+        if region not in REGIONS:
+            raise HueError(f"region must be one of {', '.join(REGIONS)}.")
+        if not isinstance(brightness, int) or isinstance(brightness, bool):
+            raise HueError("max_brightness must be a whole percentage.")
+        if not 1 <= brightness <= 100:
+            raise HueError("max_brightness must be from 1 to 100.")
+        light = Home(await self._get_bridge().get_resources()).find_target(name, "light")
+        try:
+            placements = load_placements()
+        except HueError:  # Damaged: placing the lights again starts it over.
+            placements = {}
+        placements[light.id] = {
+            "region": region,
+            "screen": screen,
+            "max_brightness": brightness / 100,
+        }
+        save_placements(placements)
+        where = "all screens" if screen is None else f"screen {screen} from the left"
+        return {
+            "placed": light.name,
+            "follows": f"{region} of {where}",
+            "max_brightness": brightness,
+        }
 
     async def _switch(self, session: Session) -> None:
         """Recall the session's look; a failure is retried after a pause."""
@@ -458,11 +768,16 @@ class Watcher:
             logger.warning("Couldn't check the lights in %s: %s", session.room_name, error)
             self._verify_due = self._clock() + RETRY_AFTER_S
 
-    def _compare(self, home: Home, group: Group, look: str) -> tuple[list[_Resend], bool]:
-        """The lights that missed a command (still on the previous look, or a red pulse), with
+    def _compare(
+        self, home: Home, group: Group, look: str, after_nudges: bool = False
+    ) -> tuple[list[_Resend], bool]:
+        """The lights that missed a command (still on the previous look, or a red pulse; with
+        `after_nudges`, also the look at another brightness: a breath or dip's way back), with
         what to resend them; and whether someone else changed a light."""
         wanted = _scene_actions(_find_scene(home, group, look))
-        previous = _scene_actions(_find_scene(home, group, self._previous_look))
+        previous = self._before_start or _scene_actions(
+            _find_scene(home, group, self._previous_look)
+        )
         missed: list[_Resend] = []
         changed = False
         for light in group.lights:
@@ -474,7 +789,10 @@ class Watcher:
             missed_switch = light.id in previous and looks.shows(
                 light.resource, previous[light.id]
             )
-            if missed_switch or looks.shows_red_pulse(light):
+            missed_nudge = after_nudges and looks.shows(
+                light.resource, _ignoring_brightness(action)
+            )
+            if missed_switch or missed_nudge or looks.shows_red_pulse(light):
                 missed.append((light, action))
             else:
                 changed = True
@@ -512,7 +830,7 @@ class Watcher:
         if group is None or scene is None:
             return
         if nudge == "red":
-            missed, changed = self._compare(home, group, session.look)
+            missed, changed = await self._compare_once_reported(bridge, home, group, session.look)
             if changed:
                 self._outside_change = True
                 return
@@ -531,6 +849,22 @@ class Watcher:
         await bridge.update("scene", scene.id, recall)
         self._pulse_left_look = False
         await anyio.sleep(back_s)
+
+    async def _compare_once_reported(
+        self, bridge: HueBridge, home: Home, group: Group, look: str
+    ) -> tuple[list[_Resend], bool]:
+        """_compare after nudges, reading the room again while a light seems changed: it may be
+        the bridge still reporting the last pulse's way back."""
+        missed, changed = self._compare(home, group, look, after_nudges=True)
+        for _ in range(REPORT_LAG_TRIES):
+            if not changed:
+                break
+            await anyio.sleep(REPORT_LAG_INTERVAL_S)
+            home = Home(await bridge.get_resources())
+            missed, changed = self._compare(
+                home, _existing_room(home, group.id), look, after_nudges=True
+            )
+        return missed, changed
 
     def _switched_off_meanwhile(
         self, lights: list[dict[str, Any]], wanted: dict[str, dict[str, Any]], reachable: set[str]
@@ -666,6 +1000,38 @@ class Watcher:
             state = self.session.to_json(self._clock(), self._wall_clock())
             atomic_write_json(_state_path(), state)
             self._saved_at = self._clock()
+
+
+STOPPED = "stopped"  # A show's end reason when asked to stop: no notification needed.
+
+
+def _show_area(resources: list[dict[str, Any]], room: str | None) -> Area:
+    if room is not None:
+        group = Home(resources).find_group(room)
+        return area_for(resources, {light.id for light in group.lights})
+    found = areas(resources)
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise HueError("There's no entertainment area; ask the user to make one in the Hue app.")
+    names = ", ".join(sorted(area.name for area in found))
+    raise HueError(f"Several entertainment areas ({names}); name the room for the show.")
+
+
+def _placements() -> dict[str, Placement]:
+    placements = {}
+    for light_id, saved in load_placements().items():
+        region, screen = saved.get("region"), saved.get("screen")
+        brightness = saved.get("max_brightness", 1.0)
+        valid_screen = screen is None or (isinstance(screen, int) and screen >= 1)
+        valid_brightness = isinstance(brightness, int | float) and 0 < brightness <= 1
+        if region in REGIONS and valid_screen and valid_brightness:
+            placements[light_id] = Placement(region, screen, float(brightness))
+    return placements
+
+
+def _show_state_path() -> Path:
+    return state_dir() / "light_show.json"
 
 
 async def notify_desktop(title: str, body: str) -> None:
@@ -818,6 +1184,10 @@ def _nudge_command(nudge: Nudge) -> tuple[dict[str, Any], float, int, float]:
 def _brightness_step(direction: Literal["up", "down"], fade_ms: int) -> dict[str, Any]:
     step = {"action": direction, "brightness_delta": looks.BREATH_DELTA}
     return {"dimming_delta": step, "dynamics": {"duration": fade_ms}}
+
+
+def _ignoring_brightness(action: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in action.items() if key != "dimming"}
 
 
 def _look_label(scene_name: str) -> str:

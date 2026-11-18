@@ -5,10 +5,10 @@ Run it before releasing a change that touches what is sent to the bridge:
     .venv/bin/python scripts/live_check.py --light "Desk"
     .venv/bin/python scripts/live_check.py --all
 
-The lights turn on, change color, play effects, are switched by timers and run a short
-pomodoro (about eight minutes in all). Room-level commands go through a temporary zone holding
-just these lights. The lights are restored and the zone removed at the end, even when a check
-fails.
+The lights turn on, change color, play effects, are switched by timers, run a short pomodoro
+and stream a light show (about eight minutes in all). Room-level commands go through a
+temporary zone holding just these lights. The lights are restored and the zone removed at the
+end, even when a check fails.
 """
 
 import argparse
@@ -29,6 +29,8 @@ from hue_mcp.bridge import HueBridge
 from hue_mcp.color import clamp_to_gamut, hex_to_xy
 from hue_mcp.config import load_config, load_location
 from hue_mcp.discovery import discover_lan_bridges
+from hue_mcp.entertainment import Stream, area_for
+from hue_mcp.errors import HueError
 from hue_mcp.home import Home, Light
 from hue_mcp.server import MAX_ACTIVE_TIMERS
 from hue_mcp.watcher import TICK_S, Watcher, boot_clock
@@ -285,10 +287,13 @@ async def main(light_names: list[str] | None) -> int:
 
         async def run_pomodoro() -> None:
             shown: list[str] = []
+            ended_because: list[str] = []
             sent: list[dict[str, Any]] = []  # The watcher's commands to the zone's lights.
 
             async def notify(title: str, body: str) -> None:
                 shown.append(title)
+                if title == "Pomodoro ended":
+                    ended_because.append(body)
 
             class Recording(HueBridge):
                 async def update(self, rtype: str, rid: str, body: dict[str, Any]) -> list[str]:
@@ -306,8 +311,14 @@ async def main(light_names: list[str] | None) -> int:
                     return sum("color" in body for body in sent)
                 return sum(body.get("dimming_delta", {}).get("action") == kind for body in sent)
 
-            def phase() -> str | None:
-                return watcher.session.phase if watcher.session else None
+            def phase() -> str:
+                if watcher.session:
+                    return watcher.session.phase
+                return f"no session ({' '.join(ended_because) or 'none started'})"
+
+            def look() -> str:
+                """The look the session should show: breaks have night versions."""
+                return watcher.session.look if watcher.session else "none"
 
             async def keep_ticking(task_group: Any) -> None:
                 while True:
@@ -337,13 +348,13 @@ async def main(light_names: list[str] | None) -> int:
                 await expect_each(await shows_scene(focus), f"not showing {focus}")
                 await at(24)  # Focus ended at 15 s, with the user still working.
                 expect(phase() == "short_break", f"in {phase()} 24 s in, not the short break")
-                await expect_each(await shows_scene("Pomodoro short break"), "no break look")
+                await expect_each(await shows_scene(look()), "no break look")
                 await at(82)  # Still working 60 s into the break: a breath.
                 expect(nudges("up") >= 1, "no breath for working through the break")
                 watcher.tracker.idled(boot_clock())  # The user steps away.
                 await at(112)  # A minute before the break ends: the dip.
                 expect(nudges("down") == 1, f"{nudges('down')} dips instead of one")
-                await expect_each(await shows_scene("Pomodoro short break"), "no look after dip")
+                await expect_each(await shows_scene(look()), "no look after dip")
                 await at(183)  # The break ended at 165 s: waiting, with red from 10 s later.
                 expect(phase() == "waiting", f"in {phase()} after the break, not waiting")
                 expect(nudges("red") >= 2, f"{nudges('red')} red pulses, not back to back")
@@ -356,7 +367,8 @@ async def main(light_names: list[str] | None) -> int:
                 watcher.tracker.idled(boot_clock())  # Away again; round 2 runs to its end.
                 await at(23, returned)
                 expect(phase() == "long_break", f"in {phase()}, not the long break")
-                await expect_each(await shows_scene("Pomodoro long break"), "no long break look")
+                expect("long break" in look(), f"showing {look()}, not a long break look")
+                await expect_each(await shows_scene(look()), "no long break look")
                 await at(33, returned)  # Waiting since 30 s; someone turns a light off.
                 await bridge.update("light", lights[0].id, {"on": {"on": False}})
                 await at(48, returned)  # The red pulse at 40 s found it instead.
@@ -367,6 +379,30 @@ async def main(light_names: list[str] | None) -> int:
             expected = ["Focus 1 of 2", "Break time", "Break's over", "Focus 2 of 2"]
             expected += ["Long break", "Break's over", "Pomodoro ended"]
             expect(shown == expected, f"notifications were {shown}")
+
+        async def streaming() -> None:
+            """Hue's entertainment streaming: the bridge hands an area's lights to the stream
+            and takes them back after."""
+            resources = await bridge.get_resources()
+            try:
+                area = area_for(resources, {light.id for light in lights})
+            except HueError as error:
+                raise CheckFailed(str(error)) from error
+            current = await bridge.get_resource("entertainment_configuration", area.id)
+            if current is not None and current.get("status") == "active":
+                raise CheckFailed(f"something streams to {area.name}; stop that show first")
+            try:
+                async with Stream(bridge, area) as stream:
+                    expect(await stream.still_ours(), "the bridge didn't hand over the area")
+                    for color in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)):
+                        end = anyio.current_time() + 2
+                        while anyio.current_time() < end:
+                            stream.send({light.id: color for light in lights})
+                            await anyio.sleep(0.02)
+            except HueError as error:
+                raise CheckFailed(str(error)) from error
+            after = await bridge.get_resource("entertainment_configuration", area.id)
+            expect(after is not None and after["status"] == "inactive", "the area stayed active")
 
         async def restore() -> str:
             """Put the lights back, checking it took: a light can miss a single command."""
@@ -408,6 +444,7 @@ async def main(light_names: list[str] | None) -> int:
             await check(
                 "pomodoro: breaks, nudges, a return, and the switch ending it", pomodoro_rounds
             )
+            await check("light show streaming: hand over, stream, hand back", streaming)
         finally:
             for scene in Home(await bridge.get_resources()).scenes:
                 if scene.group.name == ZONE_NAME:  # The pomodoro's looks.

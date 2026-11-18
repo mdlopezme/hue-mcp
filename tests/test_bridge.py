@@ -365,3 +365,42 @@ async def test_other_delete_errors_still_count():
     bridge, _ = bridge_answering(httpx2.Response(200, json=[{"error": refused}]))
     with pytest.raises(HueError, match="invalid value"):
         await bridge.delete_schedule("7")
+
+
+async def test_the_application_id_comes_from_the_auth_header():
+    bridge, requests = bridge_answering(
+        httpx2.Response(200, headers={"hue-application-id": "app-123"})
+    )
+    assert await bridge.application_id() == "app-123"
+    assert requests[0].url.path == "/auth/v1"
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (httpx2.Response(403), "run `hue-mcp setup` again"),
+        (httpx2.Response(200), "didn't say this app's id"),
+        (httpx2.Response(500, headers={"hue-application-id": "x"}), "HTTP 500"),
+    ],
+)
+async def test_a_missing_application_id_is_reported(response, error):
+    bridge, _ = bridge_answering(response)
+    with pytest.raises(HueError, match=error):
+        await bridge.application_id()
+
+
+async def test_one_resource_and_the_lights_can_be_read():
+    light = {"id": "light-1", "type": "light"}
+    bridge, requests = bridge_answering(
+        httpx2.Response(200, json={"errors": [], "data": [light]}),
+        httpx2.Response(200, json={"errors": [], "data": []}),
+        httpx2.Response(200, json={"errors": [], "data": [light]}),
+    )
+    assert await bridge.get_resource("light", "light-1") == light
+    assert await bridge.get_resource("light", "gone") is None
+    assert await bridge.get_lights() == [light]
+    assert [r.url.path for r in requests] == [
+        "/clip/v2/resource/light/light-1",
+        "/clip/v2/resource/light/gone",
+        "/clip/v2/resource/light",
+    ]

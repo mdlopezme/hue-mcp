@@ -96,6 +96,10 @@ async def test_installed_command_serves_mcp_over_stdio(tmp_path):
             "save_pomodoro_look",
             "stop_pomodoro",
             "get_pomodoro",
+            "start_light_show",
+            "stop_light_show",
+            "place_show_light",
+            "order_show_lights",
         }
         result = await client.call_tool("get_home", {})
         assert result.is_error
@@ -246,3 +250,24 @@ def test_install_watcher_needs_systemd(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["hue-mcp", "install-watcher"])
     with pytest.raises(SystemExit, match="systemctl isn't here"):
         cli.main()
+
+
+def test_show_asks_the_watcher_and_says_how_to_stop(monkeypatch, capsys):
+    asked = []
+
+    async def ask(command: str, **arguments):
+        asked.append((command, arguments))
+        if command == "show_stop":
+            return {"stopped": "the music light show"}
+        return {"playing": "the music light show", "area": "Music area", "note": "Paused."}
+
+    monkeypatch.setattr(cli, "ask_watcher", ask)
+    monkeypatch.setattr(sys, "argv", ["hue-mcp", "show", "music"])
+    cli.main()
+    monkeypatch.setattr(sys, "argv", ["hue-mcp", "show", "stop"])
+    cli.main()
+    output = capsys.readouterr().out
+    assert "Playing the music light show on Music area; `hue-mcp show stop` ends it." in output
+    assert "Paused." in output
+    assert "The music light show stopped." in output
+    assert asked[0][1]["mode"] == "music"

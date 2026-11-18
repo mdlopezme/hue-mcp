@@ -18,6 +18,7 @@ from conftest import CONFIG
 pytestmark = pytest.mark.anyio
 
 NEW_APP_KEY = "freshly-issued-key"
+NEW_CLIENT_KEY = "0123456789ABCDEF0123456789ABCDEF"
 # Read before the fixtures below patch it, so the shipped value is what gets checked.
 REAL_LINK_BUTTON_POLL_S = pairing.LINK_BUTTON_POLL_S
 LINK_BUTTON_NOT_PRESSED = [{"error": {"type": 101, "description": "link button not pressed"}}]
@@ -42,7 +43,8 @@ class FakePairingBridge:
             self.pairing_requests.append(request)
             if len(self.pairing_requests) <= self.presses_after:
                 return httpx2.Response(200, json=LINK_BUTTON_NOT_PRESSED)
-            return httpx2.Response(200, json=[{"success": {"username": NEW_APP_KEY}}])
+            success = {"username": NEW_APP_KEY, "clientkey": NEW_CLIENT_KEY}
+            return httpx2.Response(200, json=[{"success": success}])
         if request.url.path == "/clip/v2/resource":
             assert request.headers["hue-application-key"] == NEW_APP_KEY
             return httpx2.Response(200, json={"errors": [], "data": self.resources})
@@ -64,11 +66,13 @@ def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
 async def test_setup_with_ip_pairs_and_saves_a_private_config(fake, capsys):
     await pairing.run_setup(CONFIG.ip, httpx2.MockTransport(fake.handle))
 
-    assert load_config() == BridgeConfig(CONFIG.bridge_id, CONFIG.ip, NEW_APP_KEY)
+    saved = BridgeConfig(CONFIG.bridge_id, CONFIG.ip, NEW_APP_KEY, NEW_CLIENT_KEY)
+    assert load_config() == saved
     assert stat.S_IMODE(config_path().stat().st_mode) == 0o600
     assert len(fake.pairing_requests) == 3
     first_attempt = fake.pairing_requests[0]
     assert first_attempt.extensions["sni_hostname"] == CONFIG.bridge_id
+    assert json.loads(first_attempt.content)["generateclientkey"] is True  # For light shows.
     devicetype = json.loads(first_attempt.content)["devicetype"]
     assert devicetype.startswith("hue-mcp#")
     assert len(devicetype) <= 40  # The bridge's limit.

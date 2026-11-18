@@ -30,7 +30,8 @@ bootstrap pip into it with the system pip (package `python3-pip`):
 
 Setup finds the bridge (mDNS, falling back to Signify's discovery service), asks you to press
 the round link button on top of it, and saves an app key to `~/.config/hue-mcp/bridge.json`,
-readable only by you. Every connection verifies the bridge's certificate against Signify's root
+readable only by you, along with the streaming key light shows need (pairings from before
+light shows lack it: run setup again to add it). Every connection verifies the bridge's certificate against Signify's root
 CAs (bundled in `src/hue_mcp/hue_roots.pem`) and, from the first contact on, that it names the
 bridge's id. (`setup --ip` learns that id from the bridge itself, over a connection whose
 certificate must still chain to Signify's roots.)
@@ -50,6 +51,7 @@ claude mcp add --scope user hue -- /absolute/path/to/hue-mcp/.venv/bin/hue-mcp
 | `set_effect` | candle, fire, prism and other looping effects; sunrise/sunset over up to 6 h; `none` stops them |
 | `set_timer` / `list_timers` / `cancel_timer` | "Turn the bedroom off in 30 minutes", run by the bridge |
 | `start_pomodoro` / `stop_pomodoro` / `get_pomodoro` / `save_pomodoro_look` | Adaptive focus rounds whose looks follow the sun; see [Pomodoro](#pomodoro) |
+| `start_light_show` / `stop_light_show` / `place_show_light` / `order_show_lights` | Lights following the music, the screen or the processor, 25 times a second; see [Light shows](#light-shows) |
 
 Good to know:
 
@@ -70,6 +72,12 @@ Good to know:
   model it: about 0.5 W standby while off, rising linearly with brightness to the bulb's rating.
   Ratings for known models are in `src/hue_mcp/power.py`; other bulbs are assumed to be 9 W.
 
+### Permissions
+
+Claude Code asks before each tool call. You can allow `mcp__hue` in `/permissions` to skip the
+prompts, but note that light, room and scene names come from the bridge and are shown to Claude
+as-is: anyone who can rename your lights can put text in front of Claude.
+
 ## Pomodoro
 
 `start_pomodoro` runs focus rounds (25 minutes by default) with breaks between them, told apart by
@@ -85,9 +93,10 @@ the room's lights:
   breathes to dim red and back, over and over, until you're back: your first mouse move or key
   press starts the next round. If you keep working through a break, the lights breathe brighter to send you off, and
   a minute before a break ends they dip as a heads-up (breaks of two minutes or less skip both).
-- **A session ends** when you ask Claude to stop it; when someone changes the room's lights at
-  the switch or in the Hue app while it waits for you (the lights stay as they set them); or
-  after two hours away (the room fades off).
+- **A session ends** when you ask Claude to stop it; when someone turns the room's lights off
+  or changes their colors at the switch or in the Hue app while it waits for you (the lights
+  stay as they set them; a change of brightness alone is taken for a bulb that missed a
+  command, and put back); or after two hours away (the room fades off).
 - `get_pomodoro` tells the current phase and counts the rounds completed each day. Desktop
   notifications mark each switch.
 
@@ -112,11 +121,35 @@ it in the look showing. Naming a task light later gives it its white in the exis
 a light added to the room joins them. The watcher keeps its state and the
 rounds log in `~/.local/state/hue-mcp/`; its log is `journalctl --user -u hue-mcp-watch`.
 
-### Permissions
+## Light shows
 
-Claude Code asks before each tool call. You can allow `mcp__hue` in `/permissions` to skip the
-prompts, but note that light, room and scene names come from the bridge and are shown to Claude
-as-is: anyone who can rename your lights can put text in front of Claude.
+`start_light_show` streams colors to an entertainment area (make one in the Hue app: Settings,
+Entertainment areas) through Hue's entertainment API, the one Hue Sync uses: every light
+changes together, about 25 times a second. Four modes:
+
+- **music**: colors spread across the lights, swinging with the bass and punching on the beats
+  of whatever the computer plays.
+- **screen**: each light mirrors its part of the screen. `place_show_light` picks the monitor
+  (counting from 1 at the left) and the region (left, right, top, bottom, center or whole);
+  `max_brightness` keeps a light that shines on you low.
+- **both**: the screen's colors at the music's brightness.
+- **cpu**: how loaded the computer is, per core: the 1-minute load average colors the lights,
+  from blue when idle through cyan, green, yellow and orange to red when busy, and the 5-minute
+  one sets their brightness, so a burst shifts the color and only sustained work brightens the
+  room. The kernel already smooths both, so the lights drift rather than jump.
+
+`order_show_lights` sets the lights' order, around the room say: music colors spread along it. The watcher plays the show, so it outlasts the
+conversation; a running pomodoro pauses for it and carries on after. Music and screen shows end
+after 15 minutes without you at the computer; the cpu show, a monitor, stays on. Either way,
+the lights go back to how they were before the show. Flashes never come faster than three a
+second, whatever the screen or the music does.
+
+Streaming needs the system's OpenSSL (libssl 3), `parec` for the music modes, and for the
+screen modes the system Python's PyGObject and GStreamer PipeWire plugin (Debian/Ubuntu:
+`python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-pipewire`). The first screen show asks you to share
+the screen; on a multi-monitor desktop, share the full workspace and the watcher cuts it into
+monitors. Only loudness and bass leave the sound, and a 64x20-pixel thumbnail the screen;
+neither is kept.
 
 ## Development
 

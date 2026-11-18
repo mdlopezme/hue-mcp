@@ -23,7 +23,8 @@ from hue_mcp.color import (
 from hue_mcp.errors import HueError
 from hue_mcp.home import NO_EFFECT, Group, Home, Light
 from hue_mcp.looks import current_look
-from hue_mcp.watcher import WatcherNotRunning, ask_watcher
+from hue_mcp.screen import Region
+from hue_mcp.watcher import SHOW_REPLY_TIMEOUT_S, WatcherNotRunning, ask_watcher
 
 INSTRUCTIONS = """\
 Controls the user's Philips Hue lights through their Hue Bridge.
@@ -35,7 +36,11 @@ For a power budget ("use 20 watts") use set_power. Watts are estimates from the 
 since Hue bulbs don't report what they draw; say so when quoting them.
 For focus sessions use start_pomodoro, and get_pomodoro for its progress. When a result says a
 pomodoro is running in the room you changed, the change lasts until the pomodoro's next switch
-or nudge; if the user wants to keep it, call save_pomodoro_look."""
+or nudge; if the user wants to keep it, call save_pomodoro_look.
+For a light show (lights following the music, the screen, both, or how busy the computer's
+processor is) use start_light_show; to
+pick which part of the screen a light follows, place_show_light (flash the light with set_lights
+first if the user needs to tell which one it is)."""
 
 TIMER_SCHEDULE_NAME = "hue-mcp"  # Marks the bridge schedules this server created.
 MAX_ACTIVE_TIMERS = 10  # The bridge has about 100 schedule slots, shared with other apps.
@@ -45,6 +50,7 @@ LIGHT_COMMAND_SPACING_S = 0.1  # The bridge handles about 10 light commands per 
 TOUCHED_TIMEOUT_S = 3.0  # Telling the pomodoro watcher must not hold up a light change.
 
 TargetType = Literal["light", "room", "zone"]
+ShowMode = Literal["music", "screen", "both", "cpu"]
 Effect = Literal[
     "candle",
     "fire",
@@ -110,11 +116,18 @@ def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watc
             return []
         except HueError as error:
             return [f"Couldn't tell the pomodoro watcher ({error}); a pomodoro may undo this."]
+        notes = []
+        if "show" in touched:
+            notes.append(
+                f"A {touched['show']} light show is streaming there, so this won't show; when "
+                "it ends, the lights go back to how they were before it."
+            )
         if "room" not in touched:
-            return []
+            return notes
         return [
+            *notes,
             f"A pomodoro is running in {touched['room']}; this change lasts until its next "
-            f"switch or nudge, unless save_pomodoro_look keeps it in its {touched['look']} look."
+            f"switch or nudge, unless save_pomodoro_look keeps it in its {touched['look']} look.",
         ]
 
     @server.tool(annotations=READ_ONLY)
@@ -514,8 +527,76 @@ def build_server(get_bridge: Callable[[], HueBridge], ask: AskWatcher = ask_watc
             int, Field(ge=1, le=366, description="Days of completed rounds to count.")
         ] = 7,
     ) -> dict[str, Any]:
-        """The running pomodoro's phase, and the focus rounds completed each day."""
+        """The running pomodoro's phase, the focus rounds completed each day, and any light
+        show playing."""
         return await ask("status", days=days)
+
+    @server.tool()
+    async def start_light_show(
+        mode: Annotated[
+            ShowMode,
+            Field(
+                description="music: colors and flashes from what the computer plays; screen: "
+                "each light mirrors its part of the screen; both: screen colors, music "
+                "brightness; cpu: how loaded the computer is, colored by its 1-minute load "
+                "average (blue idle to red busy) and as bright as its 5-minute one."
+            ),
+        ],
+        room: Annotated[
+            str | None, Field(description="Only needed with several entertainment areas.")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Stream a light show, about 25 updates a second through Hue's entertainment API.
+
+        The watcher runs it until stop_light_show, or (except cpu, a monitor) 15 minutes
+        without the user at the computer; then the lights go back to how they were. A
+        running pomodoro pauses for it.
+        The first screen show makes the desktop ask the user to share the screen.
+        """
+        return await ask("show_start", mode=mode, room=room, timeout_s=SHOW_REPLY_TIMEOUT_S)
+
+    @server.tool()
+    async def stop_light_show() -> dict[str, Any]:
+        """Stop the light show; the lights go back to how they were before it."""
+        return await ask("show_stop")
+
+    @server.tool()
+    async def order_show_lights(
+        lights: Annotated[list[str], Field(min_length=1, description="Light names, in order.")],
+    ) -> dict[str, Any]:
+        """Set the order of the lights for light shows, e.g. around the room: music colors
+        spread along it. Saved for later shows; unlisted lights come last."""
+        return await ask("show_order", lights=lights)
+
+    @server.tool()
+    async def place_show_light(
+        light: str,
+        region: Annotated[
+            Region, Field(description="The part of the screen this light follows.")
+        ] = "whole",
+        screen: Annotated[
+            int | None,
+            Field(
+                ge=1,
+                le=16,
+                description="Which monitor, counting from 1 at the left; leave out to average "
+                "all of them.",
+            ),
+        ] = None,
+        max_brightness: Annotated[
+            int,
+            Field(ge=1, le=100, description="Percent; keep a light that shines on the user low."),
+        ] = 100,
+    ) -> dict[str, Any]:
+        """Choose which part of the screen a light follows in screen shows (saved for later
+        shows). Unplaced lights follow the whole of all screens."""
+        return await ask(
+            "show_place",
+            light=light,
+            region=region,
+            screen=screen,
+            max_brightness=max_brightness,
+        )
 
     return server
 

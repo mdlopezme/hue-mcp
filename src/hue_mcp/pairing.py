@@ -30,8 +30,8 @@ async def run_setup(ip: str | None, transport: Transport = None) -> None:
     bridge = await _locate_bridge(ip, transport)
     print(f"Found Hue Bridge {bridge.bridge_id} at {bridge.ip}.")
     print("Press the round link button on top of the bridge (waiting about a minute)...")
-    app_key = await _wait_for_link_button(bridge, transport)
-    config = BridgeConfig(bridge_id=bridge.bridge_id, ip=bridge.ip, app_key=app_key)
+    app_key, client_key = await _wait_for_link_button(bridge, transport)
+    config = BridgeConfig(bridge.bridge_id, bridge.ip, app_key, client_key)
     try:
         save_config(config)
     except OSError as error:
@@ -90,7 +90,10 @@ async def _read_bridge_id(ip: str, transport: Transport) -> str:
     return bridge_id.lower()
 
 
-async def _wait_for_link_button(bridge: DiscoveredBridge, transport: Transport) -> str:
+async def _wait_for_link_button(
+    bridge: DiscoveredBridge, transport: Transport
+) -> tuple[str, str | None]:
+    """The app key, and the client key that light shows stream with."""
     # The bridge allows at most 19 characters for the device part of the name.
     devicetype = f"{APP_NAME}#{socket.gethostname()[:19]}"
     busy = False
@@ -99,7 +102,7 @@ async def _wait_for_link_button(bridge: DiscoveredBridge, transport: Transport) 
             for _ in range(LINK_BUTTON_ATTEMPTS):
                 response = await client.post(
                     f"https://{bridge.ip}/api",
-                    json={"devicetype": devicetype},
+                    json={"devicetype": devicetype, "generateclientkey": True},
                     extensions={"sni_hostname": bridge.bridge_id},
                 )
                 busy = response.status_code in RETRY_STATUS_CODES
@@ -107,7 +110,8 @@ async def _wait_for_link_button(bridge: DiscoveredBridge, transport: Transport) 
                     result = _pairing_result(response)
                     if "success" in result:
                         app_key: str = result["success"]["username"]
-                        return app_key
+                        client_key: str | None = result["success"].get("clientkey")
+                        return app_key, client_key
                     error = result.get("error", {})
                     if error.get("type") != LINK_BUTTON_NOT_PRESSED:
                         refusal = error.get("description", result)

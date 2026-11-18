@@ -19,7 +19,8 @@ from hue_mcp.pairing import run_setup
 from hue_mcp.places import find_places
 from hue_mcp.server import build_server
 from hue_mcp.session import IDLE_TIMEOUT_S
-from hue_mcp.watcher import Watcher
+from hue_mcp.show import MODES
+from hue_mcp.watcher import SHOW_REPLY_TIMEOUT_S, Watcher, ask_watcher
 from hue_mcp.wayland_idle import WaylandError, idle_changes
 
 SERVICE_NAME = "hue-mcp-watch.service"
@@ -49,6 +50,9 @@ def main() -> None:
     commands.add_parser(
         "install-watcher", help="run the pomodoro watcher now and at every login (systemd)"
     )
+    show = commands.add_parser("show", help="start or stop a light show (the watcher plays it)")
+    show.add_argument("mode", choices=[*MODES, "stop"])
+    show.add_argument("--room", help="only needed with several entertainment areas")
     args = parser.parse_args()
 
     try:
@@ -65,12 +69,24 @@ def main() -> None:
             anyio.run(Watcher(_paired_bridge()).run)
         elif args.command == "install-watcher":
             _install_watcher()
+        elif args.command == "show":
+            print(anyio.run(_show, args.mode, args.room))
         else:
             build_server(_paired_bridge()).run()
     except HueError as error:
         sys.exit(f"{FAILURES.get(args.command, 'Failed')}: {error}")
     except (KeyboardInterrupt, EOFError):  # Ctrl+C, or Ctrl+D at a question.
         sys.exit(130)
+
+
+async def _show(mode: str, room: str | None) -> str:
+    if mode == "stop":
+        return str((await ask_watcher("show_stop"))["stopped"]).capitalize() + " stopped."
+    result = await ask_watcher("show_start", mode=mode, room=room, timeout_s=SHOW_REPLY_TIMEOUT_S)
+    lines = [f"Playing {result['playing']} on {result['area']}; `hue-mcp show stop` ends it."]
+    if "note" in result:
+        lines.append(str(result["note"]))
+    return "\n".join(lines)
 
 
 def _ipv4(text: str) -> str:
