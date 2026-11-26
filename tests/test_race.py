@@ -118,7 +118,7 @@ def test_flags_with_nothing_to_show_are_no_flag():
 
 
 def test_a_steady_look_is_its_color_at_its_brightness():
-    assert Look(race.GREEN, 0.5).at(12.3) == pytest.approx((0.0, 0.5, 0.1))
+    assert Look((0.0, 1.0, 0.2), 0.5).at(12.3) == pytest.approx((0.0, 0.5, 0.1))
 
 
 @pytest.mark.parametrize("look", [LINK_LOST, *STOP_LOOKS.values()], ids=repr)

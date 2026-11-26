@@ -42,7 +42,7 @@ RED: RGB = (1.0, 0.0, 0.0)
 ORANGE: RGB = (1.0, 0.3, 0.0)
 AMBER: RGB = (1.0, 0.55, 0.0)
 YELLOW: RGB = (1.0, 0.85, 0.0)
-GREEN: RGB = (0.0, 1.0, 0.2)
+GREEN: RGB = (0.45, 1.0, 0.35)
 BLUE: RGB = (0.1, 0.25, 1.0)
 PURPLE: RGB = (0.6, 0.0, 1.0)
 WHITE: RGB = (1.0, 1.0, 1.0)
@@ -82,7 +82,8 @@ FLAG_LOOKS: tuple[tuple[tuple[int, ...], Look], ...] = (
     ((DOUBLE_YELLOW, YELLOW_FLAG, FULL_COURSE_YELLOW), Look(YELLOW, 0.8)),
     ((BLUE_FLAG,), Look(BLUE, 0.8)),
     ((CHECKERED,), Look(WHITE, 0.8)),
-    ((GREEN_FLAG, WAVED_GREEN, *SPEED_LIMITED_GREENS), Look(GREEN, 0.8)),
+    # Up most of a race day, so soft enough to work under.
+    ((GREEN_FLAG, WAVED_GREEN, *SPEED_LIMITED_GREENS), Look(GREEN, 0.35)),
 )
 NO_FLAG = Look(WARM_WHITE, 0.1)
 

@@ -174,7 +174,7 @@ list wins:
 | Yellow | Double yellow, yellow, full course yellow |
 | Blue | Blue |
 | White | Checkered |
-| Green | Green, waved green, the speed-limited greens |
+| Soft green | Green, waved green, the speed-limited greens |
 | Dim warm white | No flag, or none for 5 s |
 
 It reads `/faults/status` (`race_msgs/FaultMultiplexerStatus`) and `/rc_to_ct`
